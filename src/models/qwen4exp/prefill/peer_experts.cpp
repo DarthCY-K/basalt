@@ -42,20 +42,9 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
             err = "prefill: the peer's piece table is too small";
             return false;
         }
-        // the activations to the host once the router has read them (the host buffer is free
-        // once the peer's upload of the last layer's is done)
-        cudaEventRecord(P.ev_in, m.cs);
-        cudaStreamWaitEvent(P.x_out, P.ev_in, 0);
-        if (P.hx_live) cudaStreamWaitEvent(P.x_out, P.ev_hx_free, 0);
-        cudaMemcpyAsync(P.hx, m.mixed, (size_t) T * N * 4, cudaMemcpyDeviceToHost, P.x_out);
-        cudaEventRecord(P.ev_hx, P.x_out);
-        P.hx_live = true;
         const int prevd = m.device;
-        cudaSetDevice(P.dev);
+        P.stage_input(m.mixed, m.cs, T);
         const cudaStream_t ps = P.s;
-        cudaStreamWaitEvent(ps, P.ev_hx, 0);
-        cudaMemcpyAsync(P.mixed, P.hx, (size_t) T * N * 4, cudaMemcpyHostToDevice, ps);
-        cudaEventRecord(P.ev_hx_free, ps);
         cudaMemcpyAsync(P.src, src_h + rows_local, (size_t) rows_peer * 4, cudaMemcpyHostToDevice, ps);
         cudaMemcpyAsync(P.f_rel, P.f_rel_host.data(), P.f_rel_host.size() * 4, cudaMemcpyHostToDevice, ps);
         // the layer's activations as FP4, once per token (the primary's bytes)
@@ -79,35 +68,23 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
             fg.h = P.H_g; fg.dm = P.Dm_b[b];
             fg.a4h = P.f_a4h; fg.gsh = P.f_gsh; fg.toh = P.f_toh; fg.rel = P.f_toh + (MMQ_GROUP + 1);
             fp4::run_group(fg, P.G, ps);
-            // the rows back through a host buffer whose last rows have reached Dm
-            const int hb = g2 % PeerPrefill::kRes;
-            cudaEventRecord(P.ev_grp[g2 % PeerPrefill::kGrpEv], ps);
-            cudaStreamWaitEvent(P.s_out, P.ev_grp[g2 % PeerPrefill::kGrpEv], 0);
-            if (P.res_live[hb]) cudaStreamWaitEvent(P.s_out, P.ev_h2d[hb], 0);
-            cudaMemcpyAsync(P.hres[hb], P.Dm_b[b], (size_t) nr * N * 4, cudaMemcpyDeviceToHost, P.s_out);
-            cudaEventRecord(P.ev_dm[b], P.s_out);
-            P.dm_live[b] = true;
-            cudaEventRecord(P.ev_d2h[hb], P.s_out);
-            cudaSetDevice(prevd);
-            cudaStreamWaitEvent(P.res_in, P.ev_d2h[hb], 0);
-            cudaMemcpyAsync(m.Dm + (size_t) (rows_local + r0) * N, P.hres[hb], (size_t) nr * N * 4,
-                            cudaMemcpyHostToDevice, P.res_in);
-            cudaEventRecord(P.ev_h2d[hb], P.res_in);
-            P.res_live[hb] = true;
-            cudaSetDevice(P.dev);
+            P.stage_rows(m.Dm + (size_t) (rows_local + r0) * N, b, nr, (size_t) g2);
         }
         cudaSetDevice(prevd);
         cudaEventRecord(P.ev_res, P.res_in);
     } else if (peer_now) {
         PeerPrefill& P = *ppc;
-        cudaEventRecord(P.ev_in, m.cs);
-        int prevd = 0;
-        cudaGetDevice(&prevd);
-        cudaSetDevice(P.dev);
+        const int prevd = m.device;
+        if (P.host_staged) {
+            P.stage_input(m.mixed, m.cs, T);
+        } else {
+            cudaEventRecord(P.ev_in, m.cs);
+            cudaSetDevice(P.dev);
+            cudaStreamWaitEvent(P.s, P.ev_in, 0);
+            if (P.out_pending) { cudaStreamWaitEvent(P.s, P.ev_done, 0); P.out_pending = false; }
+            cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, P.s);
+        }
         const cudaStream_t ps = P.s;
-        cudaStreamWaitEvent(ps, P.ev_in, 0);
-        if (P.out_pending) { cudaStreamWaitEvent(ps, P.ev_done, 0); P.out_pending = false; }
-        cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
         cudaMemcpyAsync(P.src, src_h + rows_local, (size_t) rows_peer * 4, cudaMemcpyHostToDevice, ps);
         const size_t n = order_peer.size();
         {
@@ -173,17 +150,26 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
                 dn.ids = P.ident; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = P.Dm_b[b];
                 dn.ld_dst = N;
                 P.run_ctx->run(dn, ps);
-                cudaEventRecord(P.ev_grp[g2 % PeerPrefill::kGrpEv], ps);
-                cudaStreamWaitEvent(P.s_out, P.ev_grp[g2 % PeerPrefill::kGrpEv], 0);
-                cudaMemcpyPeerAsync(m.Dm + (size_t) (rows_local + r0) * N, prevd, P.Dm_b[b], P.dev,
-                                    (size_t) nr * N * 4, P.s_out);
-                cudaEventRecord(P.ev_dm[b], P.s_out);
-                P.dm_live[b] = true;
+                if (P.host_staged) {
+                    P.stage_rows(m.Dm + (size_t) (rows_local + r0) * N, b, nr, g2);
+                } else {
+                    cudaEventRecord(P.ev_grp[g2 % PeerPrefill::kGrpEv], ps);
+                    cudaStreamWaitEvent(P.s_out, P.ev_grp[g2 % PeerPrefill::kGrpEv], 0);
+                    cudaMemcpyPeerAsync(m.Dm + (size_t) (rows_local + r0) * N, prevd, P.Dm_b[b], P.dev,
+                                        (size_t) nr * N * 4, P.s_out);
+                    cudaEventRecord(P.ev_dm[b], P.s_out);
+                    P.dm_live[b] = true;
+                }
             }
         }
-        cudaEventRecord(P.ev_done, P.s_out);
-        P.out_pending = true;
-        cudaSetDevice(prevd);
+        if (P.host_staged) {
+            cudaSetDevice(prevd);
+            cudaEventRecord(P.ev_res, P.res_in);
+        } else {
+            cudaEventRecord(P.ev_done, P.s_out);
+            P.out_pending = true;
+            cudaSetDevice(prevd);
+        }
     }
     return true;
 }

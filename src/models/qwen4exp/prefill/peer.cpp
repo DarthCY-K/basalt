@@ -92,9 +92,13 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, Tp * K));
     const MmqPlan& mp = mmq_plan();
     cudaGetDevice(&pp->prim);
+    int forward = 0, reverse = 0;
+    cudaDeviceCanAccessPeer(&forward, pp->prim, peer->device());
+    cudaDeviceCanAccessPeer(&reverse, peer->device(), pp->prim);
+    pp->host_staged = tf > 0 || !forward || !reverse;
     if (cudaEventCreateWithFlags(&pp->ev_in, cudaEventDisableTiming) != cudaSuccess) { err = "prefill peer: event"; return false; }
     bool ok = true;
-    if (tf > 0) {   // the primary's side of the FP4 share
+    if (pp->host_staged) {   // asynchronous transfer through portable host buffers
         int lo = 0, hi = 0;   // the rows' upload at the greatest priority: the layer's end waits for it
         cudaDeviceGetStreamPriorityRange(&lo, &hi);
         ok = cudaStreamCreateWithFlags(&pp->x_out, cudaStreamNonBlocking) == cudaSuccess &&
@@ -121,7 +125,7 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     };
     peer_layout(*pp, Tp, tf, mp, take);
     for (int b = 0; b < 2 && ok; ++b) ok = cudaEventCreateWithFlags(&pp->ev_dm[b], cudaEventDisableTiming) == cudaSuccess;
-    if (tf > 0) {
+    if (pp->host_staged) {
         ok = ok && cudaEventCreateWithFlags(&pp->ev_hx_free, cudaEventDisableTiming) == cudaSuccess;
         for (int b = 0; ok && b < PeerPrefill::kRes; ++b)
             ok = cudaEventCreateWithFlags(&pp->ev_d2h[b], cudaEventDisableTiming) == cudaSuccess;
@@ -135,7 +139,7 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
     size_t fb = 0, tb = 0;
     cudaMemGetInfo(&fb, &tb);
     cudaSetDevice(pp->prim);
-    if (ok && tf > 0) {   // pinned for both cards
+    if (ok && pp->host_staged) {   // pinned for both cards
         ok = cudaHostAlloc((void**) &pp->hx, (size_t) Tp * N * 4, cudaHostAllocPortable) == cudaSuccess;
         for (int b = 0; ok && b < PeerPrefill::kRes; ++b)
             ok = cudaHostAlloc((void**) &pp->hres[b], (size_t) pp->G * N * 4, cudaHostAllocPortable) == cudaSuccess;
@@ -171,7 +175,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     Impl& m = *impl_;
     if (peer == nullptr || !peer->valid()) { m.pp.reset(); return true; }
     // The peer takes the rows of the routed-only chunks (below stream_all_min()): the activations and
-    // result rows cross through host staging (cudaMemcpyPeerAsync) and the streamed ring stays off.  It also takes
+    // result rows cross through portable host buffers without direct access, and the streamed ring stays off. It also takes
     // those of a streamed chunk of up to kPeerFp4Tokens (PeerPrefill::T_fp4) where those buffers fit too.
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
     const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS

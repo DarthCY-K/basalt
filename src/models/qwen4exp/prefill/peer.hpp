@@ -80,6 +80,37 @@ struct PeerPrefill {
     cudaEvent_t ev_h2d[kRes] = {};        // primary: hres[b]'s rows are in Dm
     cudaEvent_t ev_res = nullptr;         // primary: the layer's peer rows are in Dm
     bool hx_live = false, res_live[kRes] = {};
+    bool host_staged = false;
+    // Enter on the primary and leave on the peer. The previous upload owns hx until ev_hx_free.
+    void stage_input(const float* input, cudaStream_t ready, int64_t tokens) {
+        cudaEventRecord(ev_in, ready);
+        cudaStreamWaitEvent(x_out, ev_in, 0);
+        if (hx_live) cudaStreamWaitEvent(x_out, ev_hx_free, 0);
+        cudaMemcpyAsync(hx, input, (size_t) tokens * N * sizeof(float), cudaMemcpyDeviceToHost, x_out);
+        cudaEventRecord(ev_hx, x_out);
+        hx_live = true;
+        cudaSetDevice(dev);
+        cudaStreamWaitEvent(s, ev_hx, 0);
+        cudaMemcpyAsync(mixed, hx, (size_t) tokens * N * sizeof(float), cudaMemcpyHostToDevice, s);
+        cudaEventRecord(ev_hx_free, s);
+    }
+    // Enter and leave on the peer. A host slot is reusable only after its upload to the primary.
+    void stage_rows(float* dst, int buffer, int64_t rows, size_t group) {
+        const int hb = (int) (group % kRes);
+        cudaEventRecord(ev_grp[group % kGrpEv], s);
+        cudaStreamWaitEvent(s_out, ev_grp[group % kGrpEv], 0);
+        if (res_live[hb]) cudaStreamWaitEvent(s_out, ev_h2d[hb], 0);
+        cudaMemcpyAsync(hres[hb], Dm_b[buffer], (size_t) rows * N * sizeof(float), cudaMemcpyDeviceToHost, s_out);
+        cudaEventRecord(ev_dm[buffer], s_out);
+        dm_live[buffer] = true;
+        cudaEventRecord(ev_d2h[hb], s_out);
+        cudaSetDevice(prim);
+        cudaStreamWaitEvent(res_in, ev_d2h[hb], 0);
+        cudaMemcpyAsync(dst, hres[hb], (size_t) rows * N * sizeof(float), cudaMemcpyHostToDevice, res_in);
+        cudaEventRecord(ev_h2d[hb], res_in);
+        res_live[hb] = true;
+        cudaSetDevice(dev);
+    }
     ~PeerPrefill() {
         if (dev < 0) return;
         int prev = 0;
