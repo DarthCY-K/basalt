@@ -3,6 +3,7 @@
 #include "context.hpp"
 #include "../../../program/generate/run.hpp"
 #include "models/qwen4exp/adapter.hpp"
+#include "basalt/core/diag.hpp"
 
 namespace basalt::models::qwen4exp {
 
@@ -92,8 +93,12 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     // plus the time to move the experts the primary lacks over its link; with --peer-exclusive that includes the
     // peer-only experts, staged through the host, so streaming loses until later.
     auto set_stream_all_min = [&]() {
-        if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0 && peer_streamed_share)
-            basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
+        if (o.serve && o.peer_device >= 1 && o.peer_prefill_rows != 0) {
+            if (basalt::core::exp_flag("peer_pp_tokens") == 8192)
+                basalt::prefill::Prefill::set_stream_all_min(8193);
+            else if (peer_streamed_share)
+                basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
+        }
     };
     set_stream_all_min();
     if (o.serve && o.conversation_cache_disk_mib > 0 && o.conversation_cache_dir.empty()) {

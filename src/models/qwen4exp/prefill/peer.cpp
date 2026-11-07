@@ -8,6 +8,7 @@
 #include "basalt/prefill/moe_mmq.hpp"
 #include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/core/diag.hpp"
 #include "basalt/platform/memory.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
@@ -18,6 +19,10 @@
 
 namespace basalt::prefill {
 using namespace detail;
+
+static int64_t peer_routed_limit() {
+    return core::exp_flag("peer_pp_tokens") == 8192 ? 8192 : kPeerSlowRows;
+}
 
 void Prefill::set_ring_peer(core::PeerExperts* peer) {
     impl_->ring_peer = peer != nullptr && peer->valid() ? peer : nullptr;
@@ -152,7 +157,7 @@ static bool make_peer(core::PeerExperts* peer, int64_t T_max, int64_t cap_rows, 
 uint64_t Prefill::peer_bytes(int64_t chunk, bool streamed_share) {
     if (!mmq_plan().any) return 0;
     PeerPrefill pp;
-    pp.T_max = std::min<int64_t>(chunk, streamed_share ? stream_all_min() - 1 : kPeerSlowRows);
+    pp.T_max = std::min<int64_t>(chunk, streamed_share ? stream_all_min() - 1 : peer_routed_limit());
     const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
                               ? 0 : std::min<int64_t>(chunk, kPeerFp4Tokens);
     const int64_t tf = t_fp4 >= stream_all_min() ? t_fp4 : 0;
@@ -172,7 +177,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, bool streamed_
     const int64_t t_fp4 = !streamed_share || !fp4_every_layer() || fused_ring() || stream_all_min() < FP4_MIN_TOKENS
                               ? 0 : std::min<int64_t>(m.T_max, kPeerFp4Tokens);
     std::unique_ptr<PeerPrefill> pp;
-    const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, kPeerSlowRows);
+    const int64_t t_routed = streamed_share ? m.T_max : std::min<int64_t>(m.T_max, peer_routed_limit());
     bool ok = make_peer(peer, t_routed, cap_rows, t_fp4 >= stream_all_min() ? t_fp4 : 0, pp, err);
     if (!ok && t_fp4 >= stream_all_min()) {   // the routed-only chunks alone
         pp.reset();

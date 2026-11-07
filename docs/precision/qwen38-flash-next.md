@@ -179,6 +179,14 @@ Costs: the Q6_K head adds KLD 0.0022 [0.0018, 0.0025] (1.5%) and PPL 0.25% (IQ3_
 25,500 rows. The Q8_0 two-stage head is 350 us per window against 439 us for the Q8_0 head (NVFP4, cold prose, 400 W + 180 W).
 Greedy output with the tiers pinned matches the exact head token for token.
 
+## Peer prefill experiment
+
+The local peer-prefill experiment keeps chunks through 8192 tokens on the routed MMQ path, with the streamed
+threshold raised before buffer planning and matching peer reserves and allocations. It changes no weight, KV,
+activation type or kernel, but switching from fused streaming to MMQ and moving expert work between devices can
+change floating-point rounding. Layout checks cover both sides of the threshold. API smoke and marker recall
+checks do not establish BF16 PPL/KLD parity; a BF16 reference for the local converted model is not available.
+
 ## GDN split across two cards
 
 With a peer card faster than the main card, each GDN mixer may be split by key head. The split changes reduction order, so output
