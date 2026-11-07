@@ -20,6 +20,8 @@ through the platform file calls.
 ## Windows limitations
 
 - Pinned memory is capped under WDDM: the pinned slices are limited to `RAM/2 - 8 GiB` when the whole arena cannot be registered.
+- Drivers without CUDA VMM use one allocation for peer expert caches. Inference and prompt scratch lending remain available;
+  releasing a peer cache's VRAM through sleep is unavailable.
 - Large pages need "Lock pages in memory" (Administrators). Without it the engine uses 4 KiB pages and says so at start.
 - No shared arena files and no cgroup limits. `--ple-io direct` reads through the file cache.
 - `basalt serve` runs the Python server as a child.

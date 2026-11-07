@@ -1,6 +1,7 @@
 // src/core/peer_experts.cpp - see include/basalt/core/peer_experts.hpp.
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/peer_experts.hpp"
+#include "basalt/core/vmm.hpp"
 
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/elementwise.hpp"
@@ -237,8 +238,12 @@ bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std
     if (pick.empty()) { err = "peer experts: no room or no expert left for the peer"; close(); return false; }
     std::vector<int64_t> sizes;
     for (const auto& pr : pick) sizes.push_back((int64_t) lay.blob_bytes(pr.first));
-    // in segments, so a sleep can give the slots' VRAM back and take it again at the same addresses
-    cache_.set_segment_bytes(512ll << 20);
+    // Segments let sleep release VRAM; a driver without VMM keeps one allocation.
+    const bool segmented = vmm::supported();
+    cache_.set_segment_bytes(segmented ? 512ll << 20 : 0);
+    if (!segmented) {
+        basalt::log::warn("basalt", "peer experts: VMM unavailable; one allocation, sleep unavailable");
+    }
     const bool opened = lay.native ? cache_.open_sized(sizes, n_layers, n_expert, err)
                                    : cache_.open((int64_t) pick.size(), n_layers, n_expert, (int64_t) lay.max_blob, err);
     if (!opened) { err = "peer experts: " + err; close(); return false; }
