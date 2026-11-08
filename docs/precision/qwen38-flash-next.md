@@ -59,6 +59,34 @@ Rounding moves with the chunking: `--prefill auto` reads at most 16,384 tokens p
 the chunk boundaries. Prompts above the cap read a first chunk of 16,384 tokens. The CPU computes a fixed 0.6 of streamed prompt experts.
 Split reads across cards match a main-card read: KLD mean 0.0008 (65,535 tokens) and 0.0005 (122,879), top-1 64 of 64 in both.
 
+FP16 prompt attention stores only the 12 live query rows and supplies zero fragments for the four padding rows. Unit K/V scales
+are constants. The 32-cell chunks, hi/lo MMAs, softmax and accumulation order stay the same. Shared storage is 49,072 bytes instead
+of 54,288, allowing two blocks per SM on an RTX 5070 Ti or 5060 Ti. Frozen outputs match bit for bit at 8K and 32K context on both
+cards, including short contexts and batch offsets (`qsa_prompt_attn_parity`, trailing `record` / `verify` arguments).
+At 300 W / 180 W, ABBA, 1,024 queries at 8K context: 5070 Ti 8.261 to 4.452 ms, 5060 Ti 16.211 to 8.613 ms. Useful QK+PV work is
+51.615 GFLOP per call, excluding padding and hi/lo overhead: 6.25 to 11.59 TFLOP/s and 3.18 to 5.99 TFLOP/s respectively.
+With expert tiers pinned (3,210 main, 5,573 peer; adaptation off), full-model greedy output matches the previous build:
+854 generated tokens and 895 output-head logit hashes across conversation, JSON, prose and 7K/32K/128K inputs. The 128K
+identity request reuses a 22,016-token prefix; it is not a cold prefill timing. Kernel arithmetic is bitwise neutral.
+Native ABBA at the same power limits, FP16 KV, no expert SSD spill or prompt reuse:
+
+| Test | Previous tok/s | Compact FP16 tok/s |
+|---|---:|---:|
+| Decode conversation | 101.71 | 101.07 |
+| Decode JSON | 77.27 | 77.30 |
+| Decode prose | 101.50 | 101.03 |
+| Prefill 7K | 1944.00 | 2105.78 |
+| Prefill 8K | 2554.83 | 2838.28 |
+| Prefill 32K | 3928.56 | 4652.24 |
+
+Conversation windows take 25.89 to 26.05 ms (38.63 to 38.39 passes/s); both builds span about 1.2% between rounds.
+These fixed-tier decode numbers do not represent adaptive production placement.
+With adaptation enabled, a separate ABBA gives 1,963.06 to 2,145.97 tok/s at 7K, 2,544.71 to 2,830.38 at 8K and
+3,928.98 to 4,654.58 at 32K. Conversation/prose combined throughput is 139.33 to 139.82 tok/s, not a decode gain;
+prose spans 3.2% / 5.3% across the previous / compact rounds as drafting windows change. Both tests use the native
+conversation/JSON/prose order followed by 7K/8K/32K prefill. The 8K case follows 7K, so its warmed PLE reads must not be
+compared with an 8K-first run. These results do not establish 150 tok/s decode or 3,000 tok/s short prefill.
+
 Measured prefill numbers (NVIDIA-checkpoint NVFP4 pack, 400 W + 180 W, T 3, int8 KV, 100-chunk gate unless noted):
 
 | Measurement | Result |

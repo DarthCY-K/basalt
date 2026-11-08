@@ -64,12 +64,15 @@ struct Smem {
     static constexpr int KROW = KV_MODE == 0 ? HD + 8 : HD + 16;   // elements; 16-byte aligned rows, banks spread
     static constexpr int VROW = (KV_MODE == 1 || KV_MODE == 4) ? HD + 16 : HD + 8;
     static constexpr int NG = KV_MODE == 4 ? HD / QK4_0 : 4;      // scale groups per row (q4_0: 8 of 32, else 4 of 64)
-    __half qh[16][QS];
-    __half ql[16][QS];
+    static constexpr int QROWS = KV_MODE == 0 ? G : 16;
+    // FP16 pools have unit scales; padded query rows are supplied as zero fragments.
+    static constexpr int SROWS = KV_MODE == 0 ? 1 : CH;
+    __half qh[QROWS][QS];
+    __half ql[QROWS][QS];
     KElem k[CH][KROW];
     VElem v[CH][VROW];
-    float ks[CH][NG];
-    float vs[CH][NG];
+    float ks[SROWS][NG];
+    float vs[SROWS][NG];
     float s[16][CH + 1];
     float qmax[THREADS / 32];
     float alpha[16];
@@ -107,7 +110,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
     int qe = 0;
     if (qm > 0.0f) frexpf(qm, &qe);                 // qm < 2^qe
     const float qup = ldexpf(1.0f, 14 - qe), qdown = ldexpf(scale_log2, qe - 14);
-    for (int i = t; i < 16 * HD; i += THREADS) {
+    for (int i = t; i < Smem<KV_MODE>::QROWS * HD; i += THREADS) {
         const int h = i / HD, d = i % HD;
         const float x = h < G ? q[(size_t) h * HD + d] * qup : 0.0f;
         const __half hi = __float2half_rn(x);
@@ -214,23 +217,25 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                     *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(&S.v[c][0]) + pc * 16) = vx;
                 }
             }
-            for (int i = t; i < CH * 4; i += THREADS) {
-                const int c = i / 4, g = i % 4;
-                const long long r = S.row[c];
-                float a = 0.0f, b = 0.0f;
-                if (r >= 0) {
-                    if constexpr (KV_MODE == 1) {
-                        a = __half2float(__ushort_as_half(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
-                        b = __half2float(__ushort_as_half(p.v_scale[r * (HD / KV_Q8_GROUP) + g]));
-                    } else if constexpr (KV_MODE == 3) {   // K as int8, V dequantized to fp16 (scale 1)
-                        a = __half2float(__ushort_as_half(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
-                        b = 1.0f;
-                    } else {
-                        a = b = 1.0f;
+            if constexpr (KV_MODE != 0) {
+                for (int i = t; i < CH * 4; i += THREADS) {
+                    const int c = i / 4, g = i % 4;
+                    const long long r = S.row[c];
+                    float a = 0.0f, b = 0.0f;
+                    if (r >= 0) {
+                        if constexpr (KV_MODE == 1) {
+                            a = __half2float(__ushort_as_half(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
+                            b = __half2float(__ushort_as_half(p.v_scale[r * (HD / KV_Q8_GROUP) + g]));
+                        } else if constexpr (KV_MODE == 3) {   // K as int8, V dequantized to fp16 (scale 1)
+                            a = __half2float(__ushort_as_half(p.k_scale[r * (HD / KV_Q8_GROUP) + g]));
+                            b = 1.0f;
+                        } else {
+                            a = b = 1.0f;
+                        }
                     }
+                    S.ks[c][g] = a;
+                    S.vs[c][g] = b;
                 }
-                S.ks[c][g] = a;
-                S.vs[c][g] = b;
             }
         }
         __syncthreads();
@@ -247,14 +252,15 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                 for (int kk = 0; kk < KPG; ++kk) {
                     const int k0 = (g * KPG + kk) * 16;
                     uint32_t ah[4], al[4], b[2];
+                    const bool qrow = KV_MODE != 0 || gid + 8 < G;
                     ah[0] = *reinterpret_cast<const uint32_t*>(&S.qh[gid][k0 + 2 * tig]);
-                    ah[1] = *reinterpret_cast<const uint32_t*>(&S.qh[gid + 8][k0 + 2 * tig]);
+                    ah[1] = qrow ? *reinterpret_cast<const uint32_t*>(&S.qh[gid + 8][k0 + 2 * tig]) : 0;
                     ah[2] = *reinterpret_cast<const uint32_t*>(&S.qh[gid][k0 + 2 * tig + 8]);
-                    ah[3] = *reinterpret_cast<const uint32_t*>(&S.qh[gid + 8][k0 + 2 * tig + 8]);
+                    ah[3] = qrow ? *reinterpret_cast<const uint32_t*>(&S.qh[gid + 8][k0 + 2 * tig + 8]) : 0;
                     al[0] = *reinterpret_cast<const uint32_t*>(&S.ql[gid][k0 + 2 * tig]);
-                    al[1] = *reinterpret_cast<const uint32_t*>(&S.ql[gid + 8][k0 + 2 * tig]);
+                    al[1] = qrow ? *reinterpret_cast<const uint32_t*>(&S.ql[gid + 8][k0 + 2 * tig]) : 0;
                     al[2] = *reinterpret_cast<const uint32_t*>(&S.ql[gid][k0 + 2 * tig + 8]);
-                    al[3] = *reinterpret_cast<const uint32_t*>(&S.ql[gid + 8][k0 + 2 * tig + 8]);
+                    al[3] = qrow ? *reinterpret_cast<const uint32_t*>(&S.ql[gid + 8][k0 + 2 * tig + 8]) : 0;
                     if constexpr (KV_MODE != 0) {   // modes 1 and 3: the K side is INT8 codes
                         b[0] = i8x2_to_h2(*reinterpret_cast<const uint16_t*>(&S.k[cb + gid][k0 + 2 * tig]));
                         b[1] = i8x2_to_h2(*reinterpret_cast<const uint16_t*>(&S.k[cb + gid][k0 + 2 * tig + 8]));
@@ -267,7 +273,8 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                     mma16816(tg, al, b);
 #endif
                 }
-                const float s0 = S.ks[cb + 2 * tig][g], s1 = S.ks[cb + 2 * tig + 1][g];
+                const float s0 = KV_MODE == 0 ? 1.0f : S.ks[cb + 2 * tig][g];
+                const float s1 = KV_MODE == 0 ? 1.0f : S.ks[cb + 2 * tig + 1][g];
                 sc[0] = fmaf(tg[0], s0, sc[0]);
                 sc[1] = fmaf(tg[1], s1, sc[1]);
                 sc[2] = fmaf(tg[2], s0, sc[2]);
@@ -322,18 +329,22 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
 #pragma unroll
             for (int gi = 0; gi < GPW; ++gi) {
             const int vg = warp * GPW + gi;
-            float vmax = 0.0f;
+            float vmax = KV_MODE == 0 ? 1.0f : 0.0f;
+            if constexpr (KV_MODE != 0) {
 #pragma unroll
-            for (int c = lane; c < CH; c += 32) vmax = fmaxf(vmax, fabsf(S.vs[c][vg]));
+                for (int c = lane; c < CH; c += 32) vmax = fmaxf(vmax, fabsf(S.vs[c][vg]));
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
+                for (int o = 16; o > 0; o >>= 1) vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
+            }
             const float vup = vmax > 0.0f ? 16384.0f / vmax : 0.0f;
             vdown_g[gi] = vmax * (1.0f / 16384.0f);
 #pragma unroll
             for (int ks = 0; ks < CH / 16; ++ks) {
                 const int cA = ks * 16 + 2 * tig, cB = cA + 8;
-                const float w0 = S.vs[cA][vg] * vup, w1 = S.vs[cA + 1][vg] * vup, w2 = S.vs[cB][vg] * vup,
-                            w3 = S.vs[cB + 1][vg] * vup;
+                const float w0 = KV_MODE == 0 ? vup : S.vs[cA][vg] * vup;
+                const float w1 = KV_MODE == 0 ? vup : S.vs[cA + 1][vg] * vup;
+                const float w2 = KV_MODE == 0 ? vup : S.vs[cB][vg] * vup;
+                const float w3 = KV_MODE == 0 ? vup : S.vs[cB + 1][vg] * vup;
                 const float p00 = S.s[gid][cA] * w0, p01 = S.s[gid][cA + 1] * w1;
                 const float p10 = S.s[gid + 8][cA] * w0, p11 = S.s[gid + 8][cA + 1] * w1;
                 const float p02 = S.s[gid][cB] * w2, p03 = S.s[gid][cB + 1] * w3;

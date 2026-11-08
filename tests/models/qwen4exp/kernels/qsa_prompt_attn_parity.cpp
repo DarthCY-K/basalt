@@ -11,6 +11,7 @@
 //      sub-batches: off the tile grid, a batch of one, the chunk's tail);
 // then times both over a prompt chunk (the old one in batches of 32, as src/models/qwen4exp/prefill/qsa.cpp calls it).
 // Usage: qsa_prompt_attn_parity [context=32768] [queries=2048] [reps=5]
+// Optional trailing arguments: device [record|verify frozen-output-directory].
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_decode_attn.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_prompt_attn.hpp"
@@ -24,12 +25,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace k = basalt::kernels;
 
 namespace {
+std::string frozen_mode, frozen_dir;
+
 void ck(cudaError_t e, const char* w) {
     if (e != cudaSuccess) { std::fprintf(stderr, "%s: %s\n", w, cudaGetErrorString(e)); std::exit(2); }
 }
@@ -166,7 +172,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
     ck(cudaMemcpy(o.data(), d_old, o.size() * 4, cudaMemcpyDeviceToHost), "down");
     ck(cudaMemcpy(nw.data(), d_new, nw.size() * 4, cudaMemcpyDeviceToHost), "down");
     // 1. FP64 reference on a sample of queries
-    double err_old = 0, err_new = 0, ref_scale = 0;
+    double err_old = 0, err_new = 0, err_rel = 0, ref_scale = 0;
     for (int64_t i = 0; i < nq; i += std::max<int64_t>(1, nq / 16)) {
         const int64_t w = steps[i * k::kStepCount + k::kStepWidth];
         const int32_t* sel = ids.data() + i * cap;
@@ -200,6 +206,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
                 ref_scale = std::max(ref_scale, std::fabs(r));
                 err_old = std::max(err_old, std::fabs(o[at] - r));
                 err_new = std::max(err_new, std::fabs(nw[at] - r));
+                err_rel = std::max(err_rel, std::fabs(nw[at] - r) / std::max(1e-8, std::fabs(r)));
             }
         }
     }
@@ -244,7 +251,26 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16, 2
         cudaFree(d_sub);
     }
     const bool ok1 = fmt == 1 ? err_new <= 1.5e-3 * ref_scale : err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
-    const bool ok2 = (fmt == 1 ? diff <= 2e-3 * scale : diff <= 1e-4 * scale) && same;
+    bool frozen_same = true;
+    if (!frozen_mode.empty()) {
+        const auto file = std::filesystem::path(frozen_dir) /
+            (std::to_string(fmt) + "-" + std::to_string(ctx) + "-" + std::to_string(nq) + ".bin");
+        if (frozen_mode == "record") {
+            std::filesystem::create_directories(frozen_dir);
+            std::ofstream f(file, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(nw.data()), nw.size() * sizeof(float));
+            frozen_same = bool(f);
+        } else {
+            std::ifstream f(file, std::ios::binary);
+            std::vector<float> frozen(nw.size());
+            f.read(reinterpret_cast<char*>(frozen.data()), frozen.size() * sizeof(float));
+            frozen_same = bool(f) && f.peek() == std::char_traits<char>::eof() &&
+                std::memcmp(frozen.data(), nw.data(), nw.size() * sizeof(float)) == 0;
+        }
+        std::printf("  frozen %s %s; double max_abs %.9g max_rel %.9g\n", frozen_mode.c_str(),
+                    frozen_same ? "PASS" : "FAIL", err_new, err_rel);
+    }
+    const bool ok2 = (fmt == 1 ? diff <= 2e-3 * scale : diff <= 1e-4 * scale) && same && frozen_same;
     std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
                 "scale); batch-independent %s; %.3f -> %.3f ms per chunk (%.2fx)\n",
                 ok1 && ok2 ? "PASS" : "FAIL", fmt == 2 ? "q4_0" : fmt == 1 ? "int8" : "fp16", (long long) ctx, (long long) nq, err_old,
@@ -267,9 +293,20 @@ int main(int argc, char** argv) {
     const int64_t ctx = argc > 1 ? std::atoll(argv[1]) : 32768;
     const int64_t nq = argc > 2 ? std::atoll(argv[2]) : 2048;
     const int reps = argc > 3 ? std::atoi(argv[3]) : 5;
+    const int dev = argc > 4 ? std::atoi(argv[4]) : 0;
+    if (argc > 5) {
+        if (argc != 7 || (std::strcmp(argv[5], "record") != 0 && std::strcmp(argv[5], "verify") != 0)) return 2;
+        frozen_mode = argv[5]; frozen_dir = argv[6];
+    }
+    ck(cudaSetDevice(dev), "device");
+    cudaDeviceProp prop{};
+    ck(cudaGetDeviceProperties(&prop, dev), "properties");
+    std::printf("CUDA%d %s, shared/SM %zu bytes\n", dev, prop.name, prop.sharedMemPerMultiprocessor);
     int fails = 0;
     fails += run(1, ctx, nq, reps);
     fails += run(0, ctx, nq, reps);   // FP16 KV
+    fails += run(0, 33, 33, reps);
+    fails += run(0, 1500, std::min<int64_t>(nq, 1500), reps);
     fails += run(2, ctx, nq, reps);   // Q4_0 KV (mode 4)
     fails += run(2, 1500, std::min<int64_t>(nq, 1500), reps);
     fails += run(1, 1500, std::min<int64_t>(nq, 1500), reps);   // short context: the selection is every cell
