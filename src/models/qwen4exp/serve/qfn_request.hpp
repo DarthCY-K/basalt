@@ -144,6 +144,9 @@ private:
     int64_t pair_runs{};
     int64_t pair_holds{};
     bool dec_timing{};
+    bool pool_timing{};
+    double hms0[32]{};
+    uint64_t swap_in0{}, swap_out0{};
     struct DecSnap {
         double wait, pool, host, plan, actq, jobs, run, peer_wait;
         int64_t misses, entries, hits, pcie, peer;

@@ -155,6 +155,12 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--wait-stats") basalt::core::diagnostics().wait_stats = true;
     else if (a == "--force-zero-doorbell") basalt::core::diagnostics().zero_doorbell = true;
     else if (a == "--decode-timing") basalt::core::diagnostics().decode_timing = true;
+    else if (a == "--prefill-timing") basalt::core::diagnostics().prefill_timing = true;
+    else if (a == "--prefill-timing-log") {
+        basalt::core::diagnostics().prefill_timing_log = args.next("--prefill-timing-log");
+        basalt::core::diagnostics().prefill_timing = true;
+    }
+    else if (a == "--pool-timing") basalt::core::diagnostics().pool_timing = true;
     else if (a == "--draft-log") basalt::core::diagnostics().draft_log = args.next("--draft-log");
     else if (a == "--exp") {
         const std::string list = args.next("--exp");   // NAME=VALUE[,NAME=VALUE...]

@@ -29,10 +29,44 @@ Flow QfnRequest::complete_begin() {
                      runtime_.drive.d.peer == nullptr ? "" : (", peer GPU " + fmt2((d1.peer - ds0.peer) / (w * L)) +
                                                      " (the pool waits " + fmt2((d1.peer_wait - ds0.peer_wait) / w) +
                                                      " ms/window for it)").c_str());
+        // the loop's host phases outside verify (each the time since the mark before it), and the swaps' copies
+        const basalt::core::DecodeGaps& dg = basalt::core::decode_gaps();
+        std::string hp;
+        char b[96];
+        for (int i = 0; i + 1 < basalt::core::DecodeGaps::kHostPhases; ++i) {
+            if (!basalt::core::DecodeGaps::name(i)[0]) continue;
+            std::snprintf(b, sizeof b, "%s%s %.3f", hp.empty() ? "" : ", ", basalt::core::DecodeGaps::name(i),
+                          (dg.hms[i] - hms0[i]) / w);
+            hp += b;
+        }
+        const int adapt_phase = basalt::core::DecodeGaps::kHostPhases - 1;
+        basalt::log::info("basalt decode host", "ms/window: %s; %s %.3f; swaps copied %.1f MiB in, %.1f MiB out",
+                          hp.c_str(), basalt::core::DecodeGaps::name(adapt_phase), (dg.hms[adapt_phase] - hms0[adapt_phase]) / w,
+                          (double) (runtime_.xq_in_bytes - swap_in0) / 1048576.0,
+                          (double) (runtime_.xq_out_bytes - swap_out0) / 1048576.0);
         const std::string evr = basalt::core::decode_events().report();
         if (!evr.empty()) basalt::log::raw("%s\n", evr.c_str());
         const std::string pr = runtime_.ver.profile_report();
         if (!pr.empty()) basalt::log::raw("basalt decode GPU stages (ms/window):%s\n", pr.c_str());
+    }
+    if (pool_timing) {
+        const basalt::kernels::cpu::ExpertPool::Timing t = runtime_.pool.take_timing();
+        runtime_.pool.set_timing(false);   // the prompt reads between requests run untimed
+        const double b = (double) std::max<int64_t>(t.batches, 1), w = (double) dec_windows;
+        auto per_task = [](double ms, int64_t task_count) { return task_count > 0 ? 1000.0 * ms / (double) task_count : 0.0; };
+        if (dec_windows > 0)
+            basalt::log::info("basalt decode pool", "%lld batches (%.1f per window); per batch: "
+                              "%.1f tasks (P %.1f, E %.1f) on %.1f threads (P %.1f, E %.1f), span %.3f ms, tail %.3f "
+                              "ms after the median thread, %.3f ms after the first, task time P %.3f ms (%.1f us/task) "
+                              "E %.3f ms (%.1f us/task), host waits %.3f ms; last task on an E-core in %.1f%%; per "
+                              "window parked: spin %.2f ms, asleep %.2f ms, %.1f wakes (%.2f from sleep)",
+                              (long long) t.batches, (double) t.batches / w,
+                              (double) t.tasks / b, (double) t.tasks_p / b, (double) t.tasks_e / b,
+                              (double) (t.threads_p + t.threads_e) / b, (double) t.threads_p / b,
+                              (double) t.threads_e / b, t.span_ms / b, t.tail_med_ms / b, t.tail_first_ms / b,
+                              t.busy_p_ms / b, per_task(t.busy_p_ms, t.tasks_p), t.busy_e_ms / b,
+                              per_task(t.busy_e_ms, t.tasks_e), t.host_wait_ms / b, 100.0 * (double) t.last_e / b,
+                              t.park_spin_ms / w, t.park_sleep_ms / w, (double) t.wakes / w, (double) t.sleeps / w);
     }
     return Flow::proceed;
 }

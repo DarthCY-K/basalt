@@ -28,8 +28,42 @@ Binary: **CLI** = `bin/basalt` one-shot (`--tokens IDS`), **serve** = `--serve` 
 | `--gpu-stages` | CLI | Time each layer's three graphs, print, exit. Not with a layer split. |
 | `--profile` | serve | GPU stage times per request. Not for A/B timing. |
 | `--wait-stats` | serve | Host wait times in the decode loop. |
-| `--decode-timing` | serve | One line per request on where decode time went. |
+| `--decode-timing` | serve | Per-request decode time, host phases outside verify and adaptive swap bytes. |
+| `--pool-timing` | serve | CPU expert pool span, tail, task time by core type and park time during decode. |
+| `--prefill-timing` | engine | Batched prompt stages, host waits and streamed bytes. Adds host time; not for A/B timing or layer splits. |
+| `--prefill-timing-log FILE` | engine | Also write one JSON line per prompt chunk; implies `--prefill-timing`. |
 | `--draft-log FILE` | serve | One line per verify window (width, accepted, time). |
+
+`--decode-timing` reports host time between the decode loop's phase marks. Profile-read phases are near zero
+without `--profile`. The adaptive thread runs beside the loop, so its time overlaps the other phases. Swap bytes
+count copies into the cards that run layers and evicted experts copied back to RAM; peer-tier copies are excluded.
+
+`--pool-timing` covers synchronous and asynchronous native row batches. Each task counts on the core it started on;
+workers are not pinned, so migration counts on the first core. Homogeneous CPUs report all tasks as performance-core
+tasks. Park time is summed over workers, clipped to the decode interval, and can exceed elapsed time.
+
+`--prefill-timing` records compute-stream events at stage boundaries and reads them after existing synchronizations.
+Intervals include GPU idle gaps and add up to the stream timeline. Recording and reading events adds host time;
+`event reads` reports the reads' share, also included in routing time.
+
+| Stage | What the interval holds |
+|---|---|
+| `inputs` | Embeddings, step records and chunk setup. |
+| `ple` | The n-gram block, including its row wait. |
+| `hc` | Hyper-connection reads and writes. |
+| `gdn`, `qsa` | Mixers, excluding QSA K/V appends. |
+| `kv` | K/V appends and streamed K/V staging. |
+| `router`, `shared` | Routing, predicted routing and the shared expert. |
+| `routing` | Routing read-back and GPU idle while the host groups rows. |
+| `experts` | GPU experts and peer-row waits. |
+| `ring` | Potentially blocking streamed-expert copy waits. |
+| `cpu` | CPU-row waits and upload. |
+| `combine` | Combining rows and copies ahead of the next layer. |
+| `callback` | Chunk completion and the caller's callback, including draft K/V. |
+
+Host counters report stream waits, callbacks, draft K/V within callbacks, staging waits, CPU work and event reads.
+Streamed bytes are grouped as `pinned` (DMA from the arena), `ram` (pageable memory staged first), `file` (model file)
+and `card` (another GPU). `resident` counts expert-layers read from the VRAM tier.
 
 ## Dumps and speculation tests
 

@@ -79,6 +79,19 @@ void QfnRequest::decode_state_begin() {
 void QfnRequest::decode_stats_begin() {
     // --decode-timing: where a request's decode time goes (one line per request)
     dec_timing = basalt::core::diagnostics().decode_timing;
+    if (dec_timing) {
+        auto& dg = basalt::core::decode_gaps();
+        dg.host_on = true;
+        dg.mark(-1);
+        std::copy(std::begin(dg.hms), std::end(dg.hms), std::begin(hms0));
+        swap_in0 = runtime_.xq_in_bytes;
+        swap_out0 = runtime_.xq_out_bytes;
+    }
+    pool_timing = basalt::core::diagnostics().pool_timing && !runtime_.o.no_pool;
+    if (pool_timing) {
+        runtime_.pool.set_timing(true);
+        (void) runtime_.pool.take_timing();
+    }
 
     ds0 = dec_snap();
     dt_run = 0;
@@ -481,6 +494,10 @@ void QfnRequest::decode_end() {
     copy_live = false;
 }
 
-Flow QfnRequest::decode() { return decode_loop(*this); }
+Flow QfnRequest::decode() {
+    const Flow flow = decode_loop(*this);
+    if (pool_timing) runtime_.pool.set_timing(false);
+    return flow;
+}
 
 }  // namespace basalt::models::qwen4exp::serve
