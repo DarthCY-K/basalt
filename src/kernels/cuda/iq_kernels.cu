@@ -2375,6 +2375,20 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
     q8_1_store(x[i], y, i);
 }
 
+// quantize_q8_1_kernel whose blocks past `qblocks` copy `n_words` words from src to dst instead
+__global__ void quantize_q8_1_copy_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n,
+                                          unsigned qblocks, const uint32_t* __restrict__ src, uint32_t* __restrict__ dst,
+                                          int n_words) {
+    if (blockIdx.x >= qblocks) {
+        const int w = (int) (blockIdx.x - qblocks) * blockDim.x + threadIdx.x;
+        if (w < n_words) dst[w] = src[w];
+        return;
+    }
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    q8_1_store(x[i], y, i);
+}
+
 // swiglu_entries_kernel and quantize_q8_1_kernel in one pass, over the call's own entries only:
 // [grp_start[0], grp_start[*n_groups]) (a call's entries are contiguous; the verify window's PCIe call starts after
 // its VRAM call) instead of all cap_entries twice - nothing reads the others: the down kernel reads its groups'.
@@ -2741,12 +2755,12 @@ __global__ void dequant_flat_kernel(int ty, const void* __restrict__ vx, dst_t* 
     dq_dispatch<dst_t>(ty, vx, i, y + i * QK_K, threadIdx.x, scale ? *scale : 1.0f);
 }
 // gate/up: superblock i of a role matrix (n_embd/256 per row) -> interleaved row 2r + parity
-__global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const void* __restrict__ up, int64_t per_row,
-                                  __half* __restrict__ y, const float* __restrict__ scale) {
+__global__ void dequant_gu_kernel(int ty, int ty_u, const void* __restrict__ gate, const void* __restrict__ up,
+                                  int64_t per_row, __half* __restrict__ y, const float* __restrict__ scale) {
     const int64_t i = blockIdx.x;
     const int parity = blockIdx.y;
     const int64_t r = i / per_row, c = i % per_row;
-    dq_dispatch<__half>(ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, threadIdx.x,
+    dq_dispatch<__half>(parity ? ty_u : ty, parity ? up : gate, i, y + ((2 * r + parity) * per_row + c) * QK_K, threadIdx.x,
                         scale ? scale[parity] : 1.0f);
 }
 
@@ -2983,6 +2997,16 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
     check("quantize_q8_1_rows");
 }
 
+void quantize_q8_1_rows_copy(const float* x, int64_t n_rows, int64_t n_cols, void* y, const void* src, void* dst,
+                             int n_words, void* stream) {
+    const long long n = (long long) n_rows * n_cols;
+    const unsigned qblocks = (unsigned) ((n + 255) / 256), cblocks = (unsigned) ((n_words + 255) / 256);
+    if (qblocks + cblocks == 0) return;
+    quantize_q8_1_copy_kernel<<<qblocks + cblocks, 256, 0, (cudaStream_t) stream>>>(
+        x, (block_q8_1*) y, n, qblocks, (const uint32_t*) src, (uint32_t*) dst, n_words);
+    check("quantize_q8_1_rows_copy");
+}
+
 void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
     const size_t rb = iq_row_bytes(t, n_in);
     cudaStream_t s = (cudaStream_t) stream;
@@ -3032,32 +3056,43 @@ void iq_dequant_f32(int t, const void* src, int64_t n, float* dst, void* stream)
 }
 
 void iq_dequant_gu_f16(int t, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst, void* stream,
-                       const float* scale) {
+                       const float* scale, int up_type) {
+    if (up_type < 0) up_type = t;
     // checked like the other entry points: an unknown type would leave `dst` unwritten, a wrong prompt and no error
-    if (n_embd % 256 != 0 || !is_iq(t)) { basalt::log::error("basalt", "iq_dequant_gu_f16: type %d / %lld", t, (long long) n_embd); std::exit(1); }
+    if (n_embd % 256 != 0 || !is_iq(t) || !is_iq(up_type)) { basalt::log::error("basalt", "iq_dequant_gu_f16: type %d / %d / %lld", t, up_type, (long long) n_embd); std::exit(1); }
     const int64_t per_row = n_embd / 256;
-    dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, gate, up, per_row,
+    dequant_gu_kernel<<<dim3((unsigned) (n_ff * per_row), 2), 32, 0, (cudaStream_t) stream>>>(t, up_type, gate, up, per_row,
                                                                                            (__half*) dst, scale);
     check("iq_dequant_gu_f16");
 }
 
-bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff) noexcept {
+bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, int up_type) noexcept {
     const int qg = gu_qk(gu_type), qd = d_qk(d_type);
-    return qg > 0 && qd > 0 && is_iq(gu_type) && is_iq(d_type) && n_embd % qg == 0 && n_ff % qd == 0 &&
+    bool mix = up_type < 0 || up_type == gu_type;
+    switch (gu_type * 100 + up_type) {
+#define MIX_OK(TG, TU) case TG * 100 + TU: mix = true; break;
+        GU_MIX(MIX_OK)
+#undef MIX_OK
+        default: break;
+    }
+    return mix && qg > 0 && qd > 0 && is_iq(gu_type) && is_iq(d_type) && n_embd % qg == 0 && n_ff % qd == 0 &&
            n_embd % 256 == 0 && (n_ff * n_embd) % 256 == 0;
 }
 
-NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, float swiglu_limit) {
+NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, float swiglu_limit,
+                                        int up_type) {
     NativeExpertLayout L;
     L.swiglu_limit = swiglu_limit;
     L.gu_type = gu_type;
+    L.up_type = up_type < 0 ? gu_type : up_type;
     L.d_type = d_type;
     L.n_embd = n_embd;
     L.n_ff = n_ff;
     L.gu_row = iq_row_bytes(gu_type, n_embd);
+    L.up_row = iq_row_bytes(L.up_type, n_embd);
     L.d_row = iq_row_bytes(d_type, n_ff);
     L.up_off = (size_t) n_ff * L.gu_row;
-    L.down_off = 2 * L.up_off;
+    L.down_off = L.up_off + (size_t) n_ff * L.up_row;
     L.bytes = L.down_off + (size_t) n_embd * L.d_row + (gu_type == 40 ? kNvfp4Tail : 0);   // NVFP4's scale tail
     return L;
 }
@@ -3130,6 +3165,21 @@ void grouped_impl(const NativeExpertLayout& L, const unsigned long long* grp_ptr
     if (chain && grid_groups <= 0 && g_dec_gy > 0 && gy > g_dec_gy) gy = g_dec_gy;
     const dim3 ggu((unsigned) ((2 * L.n_ff + GU_ROWS - 1) / GU_ROWS), (unsigned) gy);
     if (g_exp_phase != 2) {
+    if (L.up_type != L.gu_type) {   // a mixed layer: the gu2 rows only
+        if (v1 || !g_gu2 || g_old_kernels || !gu2_usable(L)) {
+            basalt::log::error("basalt", "native_expert_grouped: gate %d / up %d rows need the default kernels",
+                               L.gu_type, L.up_type);
+            std::exit(1);
+        }
+        const dim3 g2((unsigned) ((2 * L.n_ff + GU2_ROWS - 1) / GU2_ROWS), ggu.y);
+        switch (L.gu_type * 100 + L.up_type) {
+#define GU_MIX_CASE(TG, TU) case TG * 100 + TU: \
+            native_gu2_kernel<TG, TU><<<g2, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+            GU_MIX(GU_MIX_CASE)
+#undef GU_MIX_CASE
+            default: basalt::log::error("basalt", "native_expert_grouped: gate %d / up %d", L.gu_type, L.up_type); std::exit(1);
+        }
+    } else
     switch (L.gu_type) {
 #define GU_CASE(T) case T: launch_gu<T>(ggu, s, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, !v1); break;
         GU_FMTS(GU_CASE)
