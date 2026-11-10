@@ -273,6 +273,7 @@ class ProcessEngine:
         self.quit_s = QUIT_DISK_S if (flag_value(args, "--conversation-cache-disk-mib") or "0") != "0" else QUIT_S
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
+        self.log_follower = None
         if "slot_cv" not in self.__dict__:               # restart() wakes waiters even when the start failed
             self.slot_cv = threading.Condition()
         if "sleep_lock" not in self.__dict__:            # sleep, wake and close never overlap, across restarts too
@@ -330,8 +331,10 @@ class ProcessEngine:
             threading.Thread(target=pump_lines, args=(proc.stderr, lambda x: (self._note_conversation(proc, x), sink(x))),
                              daemon=True).start()
         elif log:
-            threading.Thread(target=follow_log, args=(log, log_start, lambda x: self._note_conversation(proc, x),
-                                                      lambda: proc.poll() is not None), daemon=True).start()
+            self.log_follower = threading.Thread(
+                target=follow_log, args=(log, log_start, lambda x: self._note_conversation(proc, x),
+                                       lambda: proc.poll() is not None), daemon=True)
+            self.log_follower.start()
         # the lines come from a thread up to READY, so the read can time out and the rest of the stream stays for _pump
         ready_q: queue.Queue = queue.Queue()
         threading.Thread(target=self._ready_pump, args=(self.proc, ready_q, self.log), daemon=True).start()
@@ -368,6 +371,8 @@ class ProcessEngine:
                     pass
             try:                                        # close its pipes and our log handle
                 self.proc.wait(timeout=5)
+                if self.log_follower is not None:
+                    self.log_follower.join()
                 self.proc.stdin.close()
                 self.proc.stdout.close()
                 if log:
@@ -1492,6 +1497,8 @@ class ProcessEngine:
             pass
         finally:
             if self.proc.poll() is not None:
+                if self.log_follower is not None:
+                    self.log_follower.join()
                 if self.pump is not None:
                     self.pump.join(timeout=2)
                 try:
