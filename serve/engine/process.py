@@ -81,7 +81,7 @@ def echo_requests(log_path: str, offset: int) -> None:
                                                  m["tg"]), flush=True)
 
 
-# The conversation cache's lines (src/models/qwen4exp/serve/conversation.cpp, src/program/serve/request_restore.cpp).
+# The conversation cache's park and restore log lines.
 CONV_PARKED = re.compile(r"conversation cache: (?:parked|skipped) \d+ tokens in [\d.]+ ms; parked=(?P<parked>\d+) "
                          r"bytes=(?P<bytes>\d+) evictions=(?P<evictions>\d+)")
 CONV_RESTORED = re.compile(r"conversation cache: restored (?P<tokens>\d+) tokens \(\w+\) in (?P<ms>[\d.]+) ms; "
