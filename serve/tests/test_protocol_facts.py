@@ -80,9 +80,8 @@ class RequestLines(unittest.TestCase):
             out = io.StringIO()
             with contextlib.redirect_stdout(out), mock.patch.object(
                     subprocess, "Popen", lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:], done], **kw)):
-                engine = ProcessEngine("basalt", [], log=str(Path(d) / "engine.log"))
-                self.addCleanup(engine.close)
-                list(engine.generate([1, 2, 3], 4, {}, threading.Event()))
+                with contextlib.closing(ProcessEngine("basalt", [], log=str(Path(d) / "engine.log"))) as engine:
+                    list(engine.generate([1, 2, 3], 4, {}, threading.Event()))
             return out.getvalue()
 
     def test_the_done_line_makes_the_request_line_without_a_log(self):
