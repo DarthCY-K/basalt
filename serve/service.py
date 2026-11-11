@@ -150,11 +150,15 @@ class Service:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
     def reasoning_budget(self, req, *, use_default: bool = True) -> int | None:
-        """The request's thinking budget in tokens, or None (0 or less: none); ValueError for a non-integer."""
+        """The request's thinking budget in tokens, or None (0 or less: none); ValueError for a non-integer.
+        Several fields: reasoning_budget_tokens, thinking_budget_tokens, llama.cpp's reasoning_budget (-1: no cap;
+        0 also turns thinking off, see frontend.llama_budget), then Anthropic's thinking.budget_tokens."""
         req = req if isinstance(req, dict) else {}
         value = req.get("reasoning_budget_tokens")
         if value is None:                               # llama.cpp's name for the same budget
             value = req.get("thinking_budget_tokens")
+        if value is None:
+            value = req.get("reasoning_budget")
         if value is None:                               # Anthropic's, which also names a level by its size
             thinking = req.get("thinking")
             value = thinking.get("budget_tokens") if isinstance(thinking, dict) else None
@@ -176,7 +180,7 @@ class Service:
         # None also means an absent field: distinguish it from an explicit opt-out.
         req = req if isinstance(req, dict) else {}
         thinking = req.get("thinking")
-        explicit = any(req.get(k) is not None for k in ("reasoning_budget_tokens", "thinking_budget_tokens")) \
+        explicit = any(req.get(k) is not None for k in ("reasoning_budget_tokens", "thinking_budget_tokens", "reasoning_budget")) \
             or isinstance(thinking, dict) and thinking.get("budget_tokens") is not None
         if explicit and request_budget is None:
             return budget
@@ -737,6 +741,7 @@ class Service:
         (same prefix, cache kept) and follows as a short system turn right before it."""
         if kwargs.get("reasoning_effort") not in (None, ""):
             kwargs = dict(kwargs, reasoning_effort=self.dialect.effort_level(kwargs["reasoning_effort"]))
+        kwargs = self.dialect.template_kwargs(kwargs)
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or not self.dialect.effort_turn or (not off and effort in (None, "", "xhigh", "high")):
@@ -960,7 +965,7 @@ class Service:
                 print(line, flush=True)
         return now
 
-    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
+    def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None, session=None) -> Iterator[tuple[str, object]]:
         """Yield ("event", Event) as text arrives, ("ping", None) as heartbeat, then ("done", {...}).
         `force`: the opening of the call the reply must make (see prepare)."""
         budget = self.reasoning_budget(sampling) if thinking else None
@@ -1073,8 +1078,9 @@ class Service:
                     while True:
                         if isinstance(ids, PromptText) and ids.max_new:
                             max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb,
+                                                   session=session) if emb \
+                            else self.engine.generate(prompt, max_new - n, sampling, cancel, session=session)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
                         looped = False                  # the wrap is for a repeated token, not the budget
                         ended_thinking = False          # the turn ended inside the thinking
