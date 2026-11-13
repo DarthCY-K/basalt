@@ -195,7 +195,8 @@ class Pages(unittest.TestCase):
 class Names(unittest.TestCase):
     def test_names_from_urls_and_paths(self):
         for source, name in (("C:\\docs\\a.pdf", "a.pdf"), ("https://x/y/b%20c.pdf?q=1", "b c.pdf"), ("/tmp/z.pdf", "z.pdf"),
-                             ("file:///tmp/d.pdf", "d.pdf"), ("https://x/", "document")):
+                             ("file:///tmp/d.pdf", "d.pdf"), ("file://C:\\docs\\a.pdf", "a.pdf"),
+                             ("file://C:/docs/a.pdf", "a.pdf"), ("https://x/", "document")):
             self.assertEqual(documents._url_name(source), name)
 
     def test_a_name_stays_on_its_line(self):

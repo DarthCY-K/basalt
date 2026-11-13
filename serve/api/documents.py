@@ -19,7 +19,7 @@ import zipfile
 from collections import OrderedDict
 from xml.etree import ElementTree
 
-from serve.engine.image_source import ImageRefused, ImageSources, load_image
+from serve.engine.image_source import ImageRefused, ImageSources, file_url_path, load_image
 
 DOCUMENT_PARTS = ("document", "file", "input_file")
 MAX_DOCUMENT_BYTES = 64 << 20       # one document's bytes after base64
@@ -96,7 +96,8 @@ def _url_name(source: str) -> str:
     path = source
     if re.match(r"[a-zA-Z][a-zA-Z0-9+.-]+://", source):
         try:
-            path = urllib.parse.unquote(urllib.parse.urlsplit(source).path)
+            path = (file_url_path(source, windows=True, relative=True) if source[:6].lower() == "file:/"
+                    else urllib.parse.unquote(urllib.parse.urlsplit(source).path))
         except ValueError:
             path = ""
     return re.split(r"[\\/]", path.rstrip("\\/"))[-1] or "document"
