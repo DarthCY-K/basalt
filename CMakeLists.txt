@@ -1505,7 +1505,7 @@ basalt_cpu_test(NAME iq1s_parity_cpu COMMAND iq1s_parity --cpu)
 # DEC_MOE's kernels on real GGUF experts, bitwise vs the path they replace (--bench: timings)
 add_executable(dec_moe_parity tests/models/qwen4exp/kernels/dec_moe_parity.cpp)
 target_include_directories(dec_moe_parity PRIVATE ${_gpu_include_directories})
-target_link_libraries(dec_moe_parity PRIVATE model_qwen4exp_kernels artifact ${_gpu_runtime_target})
+target_link_libraries(dec_moe_parity PRIVATE model_qwen4exp_kernels artifact ggml_quants ${_gpu_runtime_target})
 basalt_gpu_test(NAME dec_moe_parity_nvfp4 COMMAND dec_moe_parity --nvfp4)   # synthetic experts: no GGUF needed
 basalt_gpu_test(NAME dec_moe_parity_kq COMMAND dec_moe_parity --kq)   # synthetic experts at the real geometry (K-quant gate/up with Q5_1 / Q8_0 down, i-quant gate/up with Q5_0 down)
 if(BUILD_TESTING)

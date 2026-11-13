@@ -5,7 +5,9 @@
 #include "../../../kernels/cuda/iq_kernels.cu"
 #undef IQ_DEV_ONLY
 
+#ifndef DM_PEER_EXPERTS_ONLY
 #define FZ_DEV_ONLY
 #include "dec_gdn_rec.cu"   // the peer mixer item's recurrence (device code only)
 #undef FZ_DEV_ONLY
+#endif
 #include "dec_moe.cuh"   // DEC_MOE: the decode MoE tail's device code, on the shared row dots

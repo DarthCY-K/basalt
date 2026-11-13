@@ -33,6 +33,9 @@ using namespace verify_detail;
 static bool g_gs_off = false;   // set by Verifier::gs_decide when the split does not pay
 
 static int gs_plan_bw(const ModelGeometry& g, int dev0, int dev1) {
+    cudaDeviceProp peer_props{};
+    if (cudaGetDeviceProperties(&peer_props, dev1) != cudaSuccess || peer_props.major != 12 || peer_props.minor != 0)
+        return 0;
     const int HK = (int) g.ssm_k_heads, HV = (int) g.ssm_v_heads, S = (int) g.ssm_state_size, HIST = (int) g.ssm_d_conv - 1;
     const int64_t N = g.n_embd, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
     constexpr int kBlockCols = 256;

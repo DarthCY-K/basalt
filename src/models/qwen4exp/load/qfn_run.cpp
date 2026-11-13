@@ -80,11 +80,21 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     }
     // the peer card takes expert rows of a long prompt chunk only when it is as fast as the main one: a slower card costs the
     // chunk more than the experts it saves the main card's link, so it keeps to the short chunks it helps
-    const bool peer_streamed_share = chosen_cards.size() >= 2 && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
+    const bool first_peer_full = chosen_cards.size() >= 2 && basalt::program::gpu_main_supported(chosen_cards[1]);
+    bool all_full = true;
+    for (size_t i = 1; i < chosen_cards.size(); ++i)
+        all_full = all_full && basalt::program::gpu_main_supported(chosen_cards[i]);
+    if (!all_full && !o.layer_split.empty())
+        return fatal_start_error("layer split requires the main kernel build on every card");
+    if (chosen_cards.size() >= 2 && !first_peer_full) {
+        o.no_peer_prefill = true;
+        basalt::log::info("basalt", "first peer is decode-only; prompt experts run on the main GPU");
+    }
+    const bool peer_streamed_share = first_peer_full && basalt::program::cards_alike(chosen_cards[0], chosen_cards[1]);
     // the prompt-time layer split over the expert tier cards (PromptStage), and the most stages it may use, the main
     // card's included: every card on two cards or on three or more alike ones, none on three or more unlike cards
     // until measured on such a set.  With --batch a read splits only while no slot decodes.
-    bool split_want = o.serve && o.peer_device >= 1;
+    bool split_want = o.serve && o.peer_device >= 1 && all_full;
     bool split_alike = true;
     for (size_t i = 1; i < chosen_cards.size(); ++i)
         split_alike = split_alike && basalt::program::cards_alike(chosen_cards[0], chosen_cards[i]);

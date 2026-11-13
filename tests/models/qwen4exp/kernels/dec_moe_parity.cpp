@@ -27,6 +27,7 @@
 #include "basalt/models/qwen4exp/kernels/s2_expert_grouped.hpp"
 
 #include <cuda_runtime.h>
+#include "basalt/ggml/ggml.h"
 
 #include <algorithm>
 #include <atomic>
@@ -193,6 +194,125 @@ double time_us(cudaStream_t s, int iters, const std::function<void()>& f) {
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
     return best;
+}
+
+
+// The persistent peer alone; all reference kernels stay on device 0.
+int peer_nvfp4() {
+    int devices = 0;
+    ck(cudaGetDeviceCount(&devices), "count");
+    if (devices < 2) return 2;
+    const auto L = K::native_expert_layout(40, 40, H, FF);
+    std::mt19937 rng(117);
+    auto blobs = nvfp4_blobs(L, (int) KK, rng);
+    std::vector<float> x(MT * H);
+    std::normal_distribution<float> nd(0, .25f);
+    for (auto& v : x) v = nd(rng);
+    ck(cudaSetDevice(0), "reference device");
+    auto* b0 = dmal<uint8_t>(blobs.size());
+    ck(cudaMemcpy(b0, blobs.data(), blobs.size(), cudaMemcpyHostToDevice), "blobs");
+    auto* dx = dmal<float>(x.size());
+    ck(cudaMemcpy(dx, x.data(), x.size()*4, cudaMemcpyHostToDevice), "x");
+    const size_t qrow = H / 32 * 36;
+    auto* q0 = dmal<uint8_t>(MT * qrow);
+    K::quantize_q8_1_rows(dx, MT, H, q0, nullptr);
+    ck(cudaDeviceSynchronize(), "quantize");
+    auto qh = down(q0, MT * qrow);
+    Groups G;
+    int entry = 0;
+    for (int e = 0; e < KK; ++e) {
+        G.ptr.push_back((unsigned long long)(b0 + e * L.bytes));
+        G.start.push_back(entry);
+        for (int t = 0; t < MT; ++t, ++entry) { G.tok.push_back(t); G.dst.push_back(t*KK+e); }
+    }
+    G.start.push_back(entry); G.upload();
+    auto* scratch0 = dmal<uint8_t>(K::native_expert_scratch_bytes(K::kDmCap, FF));
+    auto* out0 = dmal<float>(K::kDmCap * H);
+    K::native_expert_grouped(L,G.d_ptr,G.d_start,G.d_n,G.d_dst,G.d_tok,entry,entry,q0,scratch0,out0,nullptr);
+    ck(cudaDeviceSynchronize(), "reference");
+    auto gpu = down(out0, entry * H);
+    std::vector<double> cpu(entry * H);
+    const auto* dq = ggml_get_type_traits(GGML_TYPE_NVFP4);
+    std::vector<float> w(H), u(H), h(MT * FF);
+    for (int e = 0; e < KK; ++e) {
+        const uint8_t* b = blobs.data() + e * L.bytes;
+        float scales[4]; std::memcpy(scales,b+L.bytes-16,16);
+        for (int r = 0; r < FF; ++r) {
+            dq->to_float(b+r*L.gu_row,w.data(),H);
+            dq->to_float(b+L.up_off+r*L.gu_row,u.data(),H);
+            for (int t = 0; t < MT; ++t) {
+                double g = 0, v = 0;
+                for (int c = 0; c < H; ++c) { g += (double)w[c]*x[t*H+c]; v += (double)u[c]*x[t*H+c]; }
+                g *= scales[0]; v *= scales[1];
+                h[t*FF+r] = (float)(g/(1+std::exp(-g))*v);
+            }
+        }
+        for (int r = 0; r < H; ++r) {
+            dq->to_float(b+L.down_off+r*L.d_row,w.data(),FF);
+            for (int t = 0; t < MT; ++t) {
+                double sum = 0;
+                for (int c = 0; c < FF; ++c) sum += (double)w[c]*h[t*FF+c];
+                cpu[(t*KK+e)*H+r] = sum*scales[2];
+            }
+        }
+    }
+    auto* ring = hmap<K::DmRing>(1);
+    auto* qmap = hmap<uint8_t>(MT * qrow);
+    auto* words = hmap<uint32_t>(64);
+    auto* rows = hmap<float>(K::kDmCap*H);
+    auto* diag = hmap<uint32_t>(K::kDmDiagWords);
+    ck(cudaSetDevice(1), "peer device");
+    auto* b1 = dmal<uint8_t>(blobs.size());
+    ck(cudaMemcpy(b1,blobs.data(),blobs.size(),cudaMemcpyHostToDevice), "peer blobs");
+    std::vector<unsigned long long> pointers(KK);
+    for (int e = 0; e < KK; ++e) pointers[e] = (unsigned long long)(b1+e*L.bytes);
+    auto* pt = dmal<unsigned long long>(KK);
+    ck(cudaMemcpy(pt,pointers.data(),KK*8,cudaMemcpyHostToDevice),"peer ptr");
+    auto* layout = dmal<K::NativeExpertLayout>(1);
+    ck(cudaMemcpy(layout,&L,sizeof L,cudaMemcpyHostToDevice),"peer layout");
+    auto* scratch = dmal<uint8_t>(K::dec_moe_peer_scratch_bytes(H,FF));
+    auto* arrive = dmal<unsigned int>(16);
+    const int blocks = K::dec_moe_peer_blocks(false);
+    std::vector<float> frozen(entry*H);
+    double gpu_abs=0, gpu_peak=0, cpu_abs=0, cpu_peak=0, cpu_l1=0, cpu_mag=0, elapsed_us=0;
+    size_t bitdiff=0, positiondiff=0;
+    int runs=0;
+    // Width eight first freezes each token's output, then every width and position.
+    for (int width : {8,1,2,3,4,5,6,7,8}) for (int offset=0; offset<MT; ++offset) {
+        std::memset(words,0,64*4); std::memset(diag,0,K::kDmDiagWords*4);
+        *ring = K::DmRing{}; ring->n_tok=width; ring->n_peer=width*KK;
+        for (int t=0; t<width; ++t) {
+            const int original=(t+offset)%MT;
+            std::memcpy(qmap+t*qrow,qh.data()+original*qrow,qrow);
+            for (int e=0;e<KK;++e) { ring->ids[t*KK+e]=e; ring->kind[t*KK+e]=2; }
+        }
+        ck(cudaMemset(arrive,0,64),"arrive");
+        *words=1u | (unsigned)width<<16 | 1u<<28;
+        K::DmPeerArgs a;
+        a.rings_m=ring; a.xq_m=qmap; a.xq_stride=MT*qrow; a.seq_m=words; a.done_m=words+16; a.rows_m=rows;
+        a.ptr=pt; a.lay=layout; a.n_expert=KK; a.k=KK; a.n_embd=H; a.n_ff=FF; a.steps=1;
+        a.scratch=scratch; a.arrive=arrive; a.diag_m=diag;
+        auto began=std::chrono::steady_clock::now();
+        if (!K::dec_moe_peer_launch(a,blocks,nullptr,false)) return 2;
+        ck(cudaDeviceSynchronize(),"peer window");
+        elapsed_us += std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-began).count();
+        ++runs;
+        if (words[16]!=1 || diag[0]) { std::printf("peer aborted done=%u diag=%u\n",words[16],diag[0]); return 1; }
+        for (int t=0;t<width;++t) for (int e=0;e<KK;++e) for(int c=0;c<H;++c) {
+            size_t at=((t+offset)%MT*KK+e)*H+c;
+            float value=rows[(t*KK+e)*H+c];
+            if (!std::isfinite(value)) return 1;
+            if (runs==1) frozen[at]=value;
+            else positiondiff += std::memcmp(&value,&frozen[at],4)!=0;
+            bitdiff += std::memcmp(&value,&gpu[at],4)!=0;
+            gpu_abs=std::max(gpu_abs,std::abs((double)value-gpu[at])); gpu_peak=std::max(gpu_peak,std::abs((double)gpu[at]));
+            cpu_abs=std::max(cpu_abs,std::abs(value-cpu[at])); cpu_peak=std::max(cpu_peak,std::abs(cpu[at]));
+            cpu_l1+=std::abs(value-cpu[at]); cpu_mag+=std::abs(cpu[at]);
+        }
+    }
+    std::printf("persistent NVFP4 H=%lld FF=%lld K=%lld widths=1..8, all positions: gpu max_abs=%.9g normalized_max=%.9g bitdiff=%zu; CPU double max_abs=%.9g normalized_max=%.9g rel_l1=%.9g; positiondiff=%zu; %.1f us/window (%d calls)\n",
+                (long long) H,(long long) FF,(long long) KK,gpu_abs,gpu_abs/gpu_peak,bitdiff,cpu_abs,cpu_abs/cpu_peak,cpu_l1/cpu_mag,positiondiff,elapsed_us/runs,runs);
+    return positiondiff || gpu_abs/gpu_peak>2e-6 || cpu_l1/cpu_mag>.03 ? 1 : 0;
 }
 
 // --stress N: N peer windows (48 rings each) of random routings - T 1..8, rings with no, few, many or only peer
@@ -506,6 +626,7 @@ void stress(const basalt::GgufFile* gguf, int l, int gt, int dt, int windows, bo
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--peer-nvfp4") == 0) return peer_nvfp4();
     setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 2) {
         std::fprintf(stderr, "usage: dec_moe_parity <shard1.gguf> [layer,layer,...] [--bench | --stress N [--stress-dup] [--stress-torn] "

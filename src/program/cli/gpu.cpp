@@ -9,7 +9,8 @@
 
 namespace basalt::program::cli {
 
-std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_cards, int max_expert_tiers) {
+std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_cards, int max_expert_tiers,
+                               bool mixed_peer_architectures) {
     namespace bp = basalt::program;
     bp::GpuSpec spec;
     std::string gerr;
@@ -25,7 +26,16 @@ std::optional<int> select_gpus(CommonOptions& o, std::vector<GpuCard>& chosen_ca
     }
     bool known = false;
     const std::vector<bp::GpuCard> visible = bp::visible_gpus(known);
-    const bp::GpuChoice choice = bp::choose_gpus(spec, visible, known);
+    bp::GpuChoice choice = bp::choose_gpus(spec, visible, known);
+    if (choice.error.empty() && !mixed_peer_architectures) {
+        for (size_t p = 1; p < choice.cards.size(); ++p) {
+            const int i = choice.cards[p];
+            if ((size_t) i < visible.size() && !bp::gpu_main_supported(visible[(size_t) i])) {
+                choice.error = "gpu: " + bp::gpu_label(visible, i) + " has no expert-tier kernel build for " + o.arch;
+                break;
+            }
+        }
+    }
     if (o.gpu_plan) {
         std::string lossy;
         for (const auto& f : o.lossy) lossy += (lossy.empty() ? "" : ",") + f.flag;

@@ -133,11 +133,9 @@ bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err) {
     return true;
 }
 
-// The main GPU runs the model's decode kernels (NVFP4 tensor cores, Blackwell instructions) — sm_120 only.
-// A peer GPU runs only the expert tier's standard CUDA kernels (Q8_1/Q2_0 rows, shared-memory rings,
-// doorbells) — any modern CUDA architecture works (sm_70+, tested on sm_89/Ada).
+// Main and peer roles use different kernel builds.
 bool gpu_main_supported(const GpuCard& c) { return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0); }
-bool gpu_peer_supported(const GpuCard& c) { return c.cc_major == 0 || c.cc_major >= 7; }
+bool gpu_peer_supported(const GpuCard& c) { return gpu_main_supported(c) || (c.cc_major == 8 && c.cc_minor == 9); }
 
 std::string gpu_label(const std::vector<GpuCard>& visible, int index) {
     std::string s = "GPU " + std::to_string(index);
@@ -164,7 +162,7 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
         for (int i = 0; i < n; ++i) {
             if (gpu_main_supported(visible[(size_t) i])) main_ok.push_back(i);
             else if (gpu_peer_supported(visible[(size_t) i])) peer_ok.push_back(i);
-            else c.notes.push_back("gpu auto: " + gpu_label(visible, i) + " skipped, no CUDA support");
+            else c.notes.push_back("gpu auto: " + gpu_label(visible, i) + " skipped, no expert-tier kernel build");
         }
         if (main_ok.empty()) {
             c.error = n == 0 ? "gpu auto: no GPU is visible" : "gpu auto: no sm_120 GPU visible (the main GPU requires Blackwell)";
@@ -177,7 +175,7 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
             if (a.mem_gbps > b.mem_gbps || (a.mem_gbps == b.mem_gbps && a.vram > b.vram)) best = i;
         }
         c.cards.push_back(best);
-        // Peers: any CUDA-capable card (sm_70+, including non-Blackwell Ada/Ampere)
+        // Peers: the architectures built for the expert window.
         for (int i : main_ok)
             if (i != best) c.cards.push_back(i);
         for (int i : peer_ok)
@@ -206,7 +204,7 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
         }
         return c;
     }
-    // Explicit list: the first card is the main (sm_120 required), the rest are peers (any CUDA GPU).
+    // Explicit list: the first card is the main, the rest need the peer kernel build.
     for (size_t idx = 0; idx < spec.list.size(); ++idx) {
         const int i = spec.list[idx];
         if (known && i >= n) {
@@ -223,7 +221,7 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
             return c;
         }
         if (known && idx > 0 && !gpu_peer_supported(visible[(size_t) i])) {
-            c.error = "gpu: " + gpu_label(visible, i) + " has no CUDA support";
+            c.error = "gpu: " + gpu_label(visible, i) + " has no expert-tier kernel build";
             c.cards.clear();
             return c;
         }

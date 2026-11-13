@@ -1,4 +1,5 @@
 // src/models/qwen4exp/kernels/dec_moe_peer_q0_m0.cu - the peer window kernel, Q2 = false, MIX = false (see dec_moe_peer.hpp).
+#define DM_PEER_EXPERTS_ONLY
 #include "dec_moe_prelude.cuh"
 #include "dec_moe_peer.cuh"
 #include "dec_moe_peer.hpp"

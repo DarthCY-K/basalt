@@ -7,7 +7,9 @@ namespace {
 // The peer's shared memory: the expert rings' or the mixer recurrence's (never both at once in a block).
 union DmPeerShared {
     DmShared d;
+#ifndef DM_PEER_EXPERTS_ONLY
     RecSmem r;
+#endif
 };
 
 // The peer window.  Per ring: block 0 waits for CUDA0's doorbell and copies the ring's header and q8_1 rows to the
@@ -93,6 +95,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
             if (hdr->n_tok < 0) return;          // released
             const int mt = hdr->n_tok;
             if constexpr (MIX) stamp(a.steps + s, 0);   // the mixer's phases: after the doorbell and each phase
+#ifndef DM_PEER_EXPERTS_ONLY
             if constexpr (MIX) if (mt > 0) {   // the peer's key heads: qkv + z, the recurrence, the norm, the out partial
                 const DmMixLayer& L = a.mixl[s];
                 const DecRecArgs& R = L.rec;
@@ -129,6 +132,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
                 __threadfence_system();
             }
             if (!dm_grid_sync(w, bar, ++bars * (unsigned int) nb, &s_ok)) return;
+#endif
             if constexpr (MIX) stamp(a.steps + s, 4);
             if (blockIdx.x == 0 && tid == 0) {
                 __threadfence_system();
