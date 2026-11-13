@@ -36,8 +36,9 @@ expert tier`:
   each; see [the GDN split](../precision/qwen38-flash-next.md#gdn-split-across-two-cards)).
 - **Idle.** The engine runs up to three expert tiers: a fifth card and later ones stay idle.
 
-Three or more cards are community-tested: the path is checked here on two cards, with two expert tiers sharing the
-second one. Reports from machines with three or four cards are welcome (see [community](../community.md)).
+Three-card decode is also checked with a Blackwell main card, a Blackwell expert tier and an Ada expert tier;
+see [expert-tier parity and quality](../precision/qwen38-flash-next.md#expert-tiers). Reports from other machines
+with three or four cards are welcome (see [community](../community.md)).
 
 ## What several cards do together
 
