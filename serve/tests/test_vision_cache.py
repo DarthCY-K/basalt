@@ -34,7 +34,7 @@ class RecordingEng(Eng):
 def sidecar():
     v = Vision.__new__(Vision)
     v.dir = EngineVision({}).dir
-    v.lock, v.cache, v.cache_bytes, v.pinned = threading.Lock(), {}, 0, {}
+    v.lock, v.cache, v.cache_bytes, v.pinned, v.videos = threading.Lock(), {}, 0, {}, {}
 
     def enc(img, out):
         out.write_bytes(SVE)
@@ -117,6 +117,35 @@ class VisionCache(unittest.TestCase):
                     v.cache_bytes = 0                    # the same image encoded again: a second attempt
                     self.assertTrue(self.readable(v, ["a"]))
                     self.assertEqual(len(set(seen)), 2, seen)
+                finally:
+                    shutil.rmtree(v.dir, ignore_errors=True)
+
+    def test_a_video_scratch_file_the_encoder_still_holds_does_not_fail_the_request(self):
+        # the same on the video path, which also encodes into a name of its own and publishes the result whole
+        seen = []
+
+        def encv(video, out, words):
+            seen.append((video.name, out.name))
+            out.write_bytes(SVE)
+            return "OK 3 3 2 12 0.3,1.5,2.4"
+
+        real_unlink = Path.unlink
+
+        def held(self, missing_ok=False):
+            if self.suffix == ".vid":
+                raise PermissionError(13, "the file is in use", str(self))
+            return real_unlink(self, missing_ok=missing_ok)
+
+        for name, make in PATHS.items():
+            with self.subTest(path=name):
+                v = make()
+                v._encv = encv
+                try:
+                    with mock.patch.object(Path, "unlink", held):
+                        combined, rows = v.encode_media([("video", b"clip", {})])
+                    self.assertEqual(combined.read_bytes(), SVE)
+                    self.assertTrue(seen[-1][0].endswith(".vid") and seen[-1][1].endswith(".part"), seen)
+                    self.assertFalse(list(v.dir.glob("*.part")))
                 finally:
                     shutil.rmtree(v.dir, ignore_errors=True)
 
