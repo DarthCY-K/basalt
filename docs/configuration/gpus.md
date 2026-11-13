@@ -9,11 +9,16 @@ One setting picks the cards: `gpu`. It means the same in the server (`"gpu"` in 
 | --- | --- | --- |
 | not set | GPU 0 alone; one warning at start names the other visible cards | GPU 0 |
 | `"0,1"`, `"1,0"`, ... | exactly these, in this order | the first one listed |
-| `"auto"` | every visible Blackwell (sm_120) card; any other card is skipped with one line naming it | the one with the most memory bandwidth, then the most VRAM |
+| `"auto"` | every visible card with a main or expert-tier kernel build | the Blackwell card with the most memory bandwidth, then the most VRAM |
 
 Cards are numbered as `nvidia-smi` numbers them. When `CUDA_VISIBLE_DEVICES` is set, the numbers count within its list
 (`CUDA_VISIBLE_DEVICES=1,0` makes `gpu 0` the card `nvidia-smi` calls 1), and its numbers are read as `nvidia-smi`'s
-too. A number past the visible cards, a card listed twice or a card that is not Blackwell stops the start with an error.
+too. A number past the visible cards, a card listed twice or a card without the role's kernel build stops the start with an error.
+
+The main card requires Blackwell (sm_120). Flash-Next also builds its decode expert-tier kernels for Ada (sm_89); other
+architectures and DeepSeek's non-Blackwell peers are rejected. An Ada peer holds and computes decode experts, including
+NVFP4 weights through the integer expert path. It takes no prompt layers, GDN mixers or output-head share. When the first
+peer is Ada, prompt experts run on the main card. A mixed-architecture set cannot use layer split or the prompt pipeline.
 
 The main card holds the dense weights, the KV cache, the drafter and its own expert cache. The engine decides what the
 other cards do and prints one line at start, for example `gpus: RTX 5090 (nvidia-smi 0) main, RTX 5060 Ti (nvidia-smi 1)

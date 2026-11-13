@@ -44,6 +44,23 @@ which experts sit where changes the last bits. On one card, a layer with enough 
 staging, except in a window that starts while an adaptive round's copies run, so that share follows the swaps' timing too. Pin
 `--adapt-swaps 0 --peer-adapt-swaps 0` for identity checks.
 
+The Ada decode expert build matches the existing GPU NVFP4 expert kernel bit for bit at widths 1 through 8 and
+every token position (2560 hidden, 640 intermediate, top-10). Its error against dequantized CPU double accumulation
+is the existing activation quantization error: max absolute 12.0071, max error divided by the reference peak 0.0112871,
+and relative L1 0.0108203. Moving experts between RAM and a GPU still changes rounding.
+
+BF16 gate, 100 chunks, T 3, FP16 KV, NVFP4/DQ6_K, tiers frozen; RTX 5070 Ti at 300 W, RTX 5060 Ti at 180 W,
+and RTX 4060 Laptop as an Ada peer (reported default limit 80 W; current limit unavailable):
+
+| Build and placement | PPL | Mean KLD | Top-1 |
+| --- | ---: | ---: | ---: |
+| `9ccaf675`, 3210 main + 5574 peer experts | 3.3015 | 0.06535 | 91.54% |
+| `d97682f6`, same placement | 3.3015 | 0.06535 | 91.54% |
+| `d97682f6`, 3210 main + 5181 peer + 2062 Ada experts | 3.3022 | 0.06630 | 91.47% |
+
+Both dual-card builds match all 25,500 scored rows exactly. The three-card result changes expert placement as well
+as architecture; the isolated peer-kernel test above checks architecture parity.
+
 ### Prefill
 
 Prefill is a different computation from decode: fp16 and BF16 GEMMs, int8 MMQ, and FP4 tensor cores for NVFP4 experts. The gate
