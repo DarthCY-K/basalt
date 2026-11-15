@@ -168,7 +168,7 @@ int main() {
         if (v.size() == 2) {
             CHECK_STR(v[0].token, "1");
             CHECK_STR(v[1].token, "0");
-            apply_gpus(v, pick("1", v).cards);
+            apply_gpus(v, {1});
             const char* now = std::getenv("CUDA_VISIBLE_DEVICES");
             CHECK_STR(now ? now : "", "0");
             const char* order = std::getenv("CUDA_DEVICE_ORDER");
