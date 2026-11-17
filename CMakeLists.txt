@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
 endif()
-project(basalt VERSION 0.4.0 LANGUAGES C CXX CUDA)
+project(basalt VERSION 0.4.1 LANGUAGES C CXX CUDA)
 add_compile_definitions(BASALT_VERSION="${PROJECT_VERSION}")
 
 set(CMAKE_CXX_STANDARD 20)
@@ -16,6 +16,9 @@ endif()
 option(BUILD_TESTING "Build the tests and parity programs" OFF)
 # Covers the project's own C++ and CUDA sources only; off by default so a newer compiler's new warning cannot break a user build.
 option(WERROR "Treat compiler warnings as errors" OFF)
+# Optional peer architectures: building the peer-tier kernels for sm_89 (Ada) in addition to sm_120
+# allows a non-Blackwell card to serve as the expert tier, but adds build time.
+option(PEER_ADA "Compile peer kernels for sm_89 (Ada) in addition to sm_120" OFF)
 if(BUILD_TESTING)
   enable_testing()
 endif()
@@ -38,8 +41,8 @@ endfunction()
 # explicitly for the host-side programs that call the runtime themselves
 find_package(CUDAToolkit REQUIRED)
 # Main kernels (NVFP4 tensor cores, TMA, Blackwell instructions) compile for sm_120 only.
-# Peer kernels (Q8_1/Q2_0 expert rows, standard CUDA) additionally compile for sm_89 (Ada)
-# so a non-Blackwell card can serve as the expert tier.
+# When PEER_ADA is enabled, peer kernels (Q8_1/Q2_0 expert rows, standard CUDA) additionally compile
+# for sm_89 (Ada) so a non-Blackwell card can serve as the expert tier.
 foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[-a].*$" "" _base "${_a}")     # 120-real / 120a are still 120
   if(NOT _base STREQUAL "120")
@@ -116,7 +119,9 @@ else()
   set(_isa_avx512_flags "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
   set(_isa_avx2_flags "-mavx2;-mfma;-mf16c")
   set(_isa_avxvnni_flags "-mavx2;-mfma;-mf16c;-mavxvnni;-mbmi2")
-  set(_isa_avxvnniint8_flags "-mavx2;-mfma;-mf16c;-mavxvnniint8")
+  # -mno-avx512f keeps the file below EVEX under a global -march=native: there vpdpbssd lands on ymm16+, which
+  # only its AVX10.2 form encodes, so the assembler refuses it or emits an instruction AVX-512 CPUs do not run.
+  set(_isa_avxvnniint8_flags "-mavx2;-mfma;-mf16c;-mavxvnniint8;-mno-avx512f")
   set(_isa_avx1_flags "-mavx")
 endif()
 
@@ -132,7 +137,7 @@ target_link_libraries(artifact INTERFACE platform warnings)
 # `model` is the registry and the adapter interface (shared code may use it). Each model is its own library under
 # src/models/<arch>/; `models` is the composition root that registers them. tools/check_model_layering.sh keeps
 # shared code from including src/models and models from including each other.
-add_library(model STATIC src/model/registry.cpp)
+add_library(model STATIC src/model/registry.cpp src/model/rope_flags.cpp)
 target_compile_definitions(model PRIVATE BASALT_KNOWN_MODELS="${_basalt_known}" BASALT_BUILT_MODELS="${_basalt_built}")
 target_include_directories(model PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(model PUBLIC artifact warnings)
@@ -203,7 +208,7 @@ endif()
 if(BASALT_MODEL_QWEN35)
 # The shared dense stack (hybrid GDN / gated attention layers, dense FFN) and the model built on it; qwen35 is its
 # only model, so the stack is built with it
-add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp)
+add_library(dense STATIC src/dense/model.cpp src/dense/forward.cpp src/dense/session.cpp src/dense/stage.cpp src/dense/split_plan.cpp)
 target_include_directories(dense PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include PRIVATE ${_gpu_include_directories})
 target_link_libraries(dense PUBLIC model kernels window_gemm mmq prefill_fp4 prefill_fp8 core warnings ${_gpu_runtime_target})
 add_library(model_qwen35 STATIC src/models/qwen35/adapter.cpp)
@@ -216,11 +221,26 @@ if(BUILD_TESTING)
   target_link_libraries(qwen35_checkpoint_round_trip PRIVATE model_qwen35 ${_gpu_runtime_target})
   basalt_gpu_test(NAME qwen35_checkpoint_round_trip COMMAND qwen35_checkpoint_round_trip)
   set_tests_properties(qwen35_checkpoint_round_trip PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+  # a second card's prompt line leaves the session as a read on one card does (27B pack and two GPUs; skipped without)
+  add_executable(qwen35_prompt_line_test tests/models/qwen35/prompt_line_test.cpp)
+  target_link_libraries(qwen35_prompt_line_test PRIVATE model_qwen35 ${_gpu_runtime_target})
+  basalt_gpu_test(NAME qwen35_prompt_line_test COMMAND qwen35_prompt_line_test)
+  set_tests_properties(qwen35_prompt_line_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+  # the layer split across two cards gives the main card's output to the bit (27B pack and two GPUs; skipped without)
+  add_executable(qwen35_split_test tests/models/qwen35/split_test.cpp)
+  target_link_libraries(qwen35_split_test PRIVATE model_qwen35 ${_gpu_runtime_target})
+  basalt_gpu_test(NAME qwen35_split_test COMMAND qwen35_split_test)
+  set_tests_properties(qwen35_split_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 2400)
   # the matrix types and shapes the 27B reads, and the re-convert refusal for a pack older than NVFP4_PLANES (host only)
   add_executable(qwen35_linear_types_test tests/models/qwen35/linear_types_test.cpp)
   target_include_directories(qwen35_linear_types_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(qwen35_linear_types_test PRIVATE warnings)
   basalt_cpu_test(NAME qwen35_linear_types_test COMMAND qwen35_linear_types_test)
+  # where the 27B's layers go on two cards: one card when it fits, else the cut for alike and unlike cards (host only)
+  add_executable(qwen35_split_plan_test tests/models/qwen35/split_plan_test.cpp src/dense/split_plan.cpp)
+  target_include_directories(qwen35_split_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(qwen35_split_plan_test PRIVATE warnings)
+  basalt_cpu_test(NAME qwen35_split_plan_test COMMAND qwen35_split_plan_test)
 endif()
 endif()
 
@@ -351,7 +371,7 @@ endif()
 
 # ---- core (GPU runtime) ---------------------------------------------
 add_library(core STATIC src/core/device.cu src/core/pinned.cu src/core/ram_load.cpp src/core/vmm.cpp src/core/graph.cpp src/core/weights.cpp src/core/direct_upload.cpp
-                             src/core/host_plan.cpp src/core/checkpoint_transfer.cpp)
+                             src/core/host_plan.cpp src/core/checkpoint_transfer.cpp src/core/staged_copy.cpp)
 target_include_directories(core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # The selected runtime is PUBLIC because graph.cpp is a HOST translation unit that calls cudaGraphLaunch and
 # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
@@ -364,6 +384,46 @@ target_link_libraries(basalt-device PRIVATE core)
 if(BASALT_MODEL_QWEN4EXP)
 add_executable(basalt-load src/models/qwen4exp/plan/load_main.cpp)
 target_link_libraries(basalt-load PRIVATE core kernels)
+endif()
+
+# Peer-tier compilation: the expert-window decode kernels, the peer prefill mmq/iota kernels and the
+# small utility kernels that run on the peer card additionally compile for sm_89 (Ada), so a non-Blackwell
+# card can serve as the expert tier. Must be set BEFORE the targets that compile these files are defined.
+if(PEER_ADA)
+  add_compile_definitions(BASALT_PEER_ADA=1)
+  set_source_files_properties(
+    src/models/qwen4exp/kernels/dec_moe.cu
+    src/models/qwen4exp/kernels/dec_moe_peer_q0_m0.cu
+    src/models/qwen4exp/kernels/dec_moe_peer_q0_m1.cu
+    src/models/qwen4exp/kernels/dec_moe_peer_q1_m0.cu
+    src/models/qwen4exp/kernels/dec_moe_peer_q1_m1.cu
+    src/prefill/moe_mmq.cu
+    src/prefill/mmq/mmq_host.cu
+    src/prefill/mmq/quantize.cu
+    src/prefill/mmq/instances/mmq_q2_0.cu
+    src/prefill/mmq/instances/mmq_iq1_s.cu
+    src/prefill/mmq/instances/mmq_iq1_m.cu
+    src/prefill/mmq/instances/mmq_iq2_xxs.cu
+    src/prefill/mmq/instances/mmq_iq2_xs.cu
+    src/prefill/mmq/instances/mmq_iq2_s.cu
+    src/prefill/mmq/instances/mmq_iq3_xxs.cu
+    src/prefill/mmq/instances/mmq_iq3_s.cu
+    src/prefill/mmq/instances/mmq_iq4_nl.cu
+    src/prefill/mmq/instances/mmq_iq4_xs.cu
+    src/prefill/mmq/instances/mmq_q8_0.cu
+    src/prefill/mmq/instances/mmq_q5_0.cu
+    src/prefill/mmq/instances/mmq_q5_1.cu
+    src/prefill/mmq/instances/mmq_q2_k.cu
+    src/prefill/mmq/instances/mmq_q3_k.cu
+    src/prefill/mmq/instances/mmq_q4_k.cu
+    src/prefill/mmq/instances/mmq_q5_k.cu
+    src/prefill/mmq/instances/mmq_q6_k.cu
+    src/kernels/cuda/iq_kernels.cu
+    src/kernels/cuda/quantize_act.cu
+    src/kernels/cuda/wait_abort.cu
+    src/kernels/cuda/sampler.cu
+    src/kernels/cuda/elementwise.cu
+    PROPERTIES COMPILE_OPTIONS "--generate-code=arch=compute_89,code=sm_89")
 endif()
 
 # ---- kernels ----
@@ -586,6 +646,7 @@ add_library(serve_shared STATIC src/program/serve/commands.cpp
             src/program/serve/request_parse.cpp
             src/program/serve/request_prefill.cpp
             src/program/serve/request_restore.cpp
+            src/program/serve/prompt_handles.cpp
             src/program/serve/session_engine.cpp
             src/program/cli/tokens.cpp
             src/program/cli/help.cpp)
@@ -599,7 +660,7 @@ add_executable(basalt src/program/generate.cpp
                        src/program/cli/serve.cpp
                        src/program/cli/startup.cpp
                        src/program/cli/gpu.cpp)
-set_target_properties(basalt PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+basalt_ship_to_bin(basalt)
 target_include_directories(basalt PRIVATE ${_gpu_include_directories})
 target_link_libraries(basalt PRIVATE models serve_shared engine_session ${_gpu_runtime_target})
 basalt_embed_manifest(basalt)
@@ -651,7 +712,7 @@ if(BUILD_TESTING)
   set_tests_properties(tokenizer_test PROPERTIES TIMEOUT 60)
 endif()
 add_executable(basalt-bench src/program/bench_main.cpp)
-set_target_properties(basalt-bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+basalt_ship_to_bin(basalt-bench)
 # the image encoder sidecar, bin/basalt-vision (its own project, built with this one)
 add_subdirectory(tools/vision)
 if(BASALT_MODEL_QWEN4EXP)
@@ -708,7 +769,8 @@ target_compile_definitions(basalt-bench PRIVATE
 
 # basalt-probe: starts the engine, measures its rates and cold decode speed, prints a report
 add_executable(basalt-probe src/program/probe_main.cpp)
-set_target_properties(basalt-probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+basalt_ship_to_bin(basalt-probe)
+add_dependencies(basalt-probe basalt)
 target_link_libraries(basalt-probe PRIVATE engine_session platform warnings ${CMAKE_DL_LIBS})
 basalt_embed_manifest(basalt-probe)
 target_compile_definitions(basalt-probe PRIVATE
@@ -765,6 +827,11 @@ add_executable(window_gemm_parity tests/kernels/window_gemm_parity.cpp)
 target_link_libraries(window_gemm_parity PRIVATE window_gemm kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME window_gemm_parity COMMAND window_gemm_parity)
 set_tests_properties(window_gemm_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+# a second card planned as the main card gives its window products bit for bit (two GPUs; skipped without)
+add_executable(window_gemm_two_gpu tests/kernels/window_gemm_two_gpu.cpp)
+target_link_libraries(window_gemm_two_gpu PRIVATE window_gemm kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME window_gemm_two_gpu COMMAND window_gemm_two_gpu)
+set_tests_properties(window_gemm_two_gpu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 # the FP8 and FP4 codes as bf16x2 (narrow_bf16.cuh): the direct cvt (CUDA 13.2+) and the f16 route, every input
 add_executable(narrow_bf16_parity tests/kernels/narrow_bf16_parity.cu)
 set_target_properties(narrow_bf16_parity PROPERTIES CUDA_ARCHITECTURES 120a-real)
@@ -776,6 +843,11 @@ add_executable(gqa_attn_parity tests/kernels/gqa_attn_parity.cpp)
 target_link_libraries(gqa_attn_parity PRIVATE kernels ${_gpu_runtime_target})
 basalt_gpu_test(NAME gqa_attn_parity COMMAND gqa_attn_parity)
 set_tests_properties(gqa_attn_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+# a cache split in two places (K/V streaming): every attention kernel and the cache writes bitwise their one-buffer launches
+add_executable(gqa_far_parity tests/kernels/gqa_far_parity.cpp)
+target_link_libraries(gqa_far_parity PRIVATE kernels ${_gpu_runtime_target})
+basalt_gpu_test(NAME gqa_far_parity COMMAND gqa_far_parity)
+set_tests_properties(gqa_far_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 add_executable(iq_parity tests/kernels/iq_parity.cpp)
 target_include_directories(iq_parity PRIVATE ${_gpu_include_directories})
 target_link_libraries(iq_parity PRIVATE kernels ${_gpu_runtime_target})
@@ -1423,6 +1495,11 @@ if(BUILD_TESTING)
   add_executable(conv_cache_test tests/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   basalt_cpu_test(NAME conv_cache_test COMMAND conv_cache_test)
+  # a held conversation met against a prompt, the model's own pieces standing for the same bytes (header-only, CPU)
+  add_executable(prefix_anchor_test tests/program/prefix_anchor_test.cpp)
+  target_include_directories(prefix_anchor_test PRIVATE src)
+  target_link_libraries(prefix_anchor_test PRIVATE warnings)
+  basalt_cpu_test(NAME prefix_anchor_test COMMAND prefix_anchor_test)
   # where a prompt read from token 0 places the chain's root: the system prompt's end, never the reply's header (CPU)
   add_executable(prompt_parts_test tests/program/prompt_parts_test.cpp)
   target_include_directories(prompt_parts_test PRIVATE src)
