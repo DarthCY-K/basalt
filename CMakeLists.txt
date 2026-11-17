@@ -392,7 +392,6 @@ endif()
 if(PEER_ADA)
   add_compile_definitions(BASALT_PEER_ADA=1)
   set_source_files_properties(
-    src/models/qwen4exp/kernels/dec_moe.cu
     src/models/qwen4exp/kernels/dec_moe_peer_q0_m0.cu
     src/models/qwen4exp/kernels/dec_moe_peer_q0_m1.cu
     src/models/qwen4exp/kernels/dec_moe_peer_q1_m0.cu
