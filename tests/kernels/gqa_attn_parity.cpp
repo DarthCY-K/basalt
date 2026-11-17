@@ -449,7 +449,8 @@ int main(int argc, char** argv) {
     // The hashes below are those of the kernel before its next-chunk fetch; a change that must not move a bit leaves them as they are.
     {
         std::mt19937 hr(99);
-        std::normal_distribution<float> hn(0.f, 1.f);
+        // mt19937 and power-of-two scaling give the same fixture in every standard library.
+        const auto hn = [](std::mt19937& r) { return float(int(r() >> 8) - 8388608) / 4194304.0f; };
         const int64_t cap = 4096;
         const size_t n = (size_t) cap * NKV * HD;
         std::vector<uint16_t> hk(n), hv(n);
@@ -527,7 +528,7 @@ int main(int argc, char** argv) {
             basalt::kernels::gqa_decode_attn_segs(dq, NH, NKV, sg, 2, dscr, cap, dout, nullptr);
             fold(hash[3], (size_t) 12 * NH * HD);
         }
-        const unsigned long long frozen[4] = {0x430a8888287f57faull, 0xb6471ecdf9c79b73ull, 0x1c64ae81d108b6b5ull, 0x24e2ead0c780fabeull};
+        const unsigned long long frozen[4] = {0x9fa8063b43b01b2cull, 0x22cf7387e47a6fe6ull, 0xbc108048d619d8ecull, 0xc60d181751f58ea9ull};
         std::printf("decode hashes: %016llx %016llx %016llx %016llx\n", hash[0], hash[1], hash[2], hash[3]);
         bool frozen_ok = true;
         for (int i = 0; i < 4; ++i) frozen_ok = frozen_ok && hash[i] == frozen[i];
