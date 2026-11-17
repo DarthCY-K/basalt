@@ -162,6 +162,17 @@ int read_ahead_cases() {
         advise_willneed(c.p, c.n);
         std::printf("read-ahead %-58s -> returned\n", c.what);
     }
+    const void* ranges[] = {base + 1234, nullptr, base, base + bytes - 1};
+    const uint64_t lengths[] = {8ull << 10, 4096, 0, 1};
+    advise_willneed(ranges, lengths, 4);
+    advise_willneed(nullptr, lengths, 4);
+    advise_willneed(ranges, nullptr, 4);
+    advise_willneed(ranges, lengths, 0);
+    // More than one batch, with a partial final batch and repeated, overlapping ranges.
+    std::vector<const void*> repeated(513, base);
+    std::vector<uint64_t> repeated_lengths(repeated.size(), bytes);
+    advise_willneed(repeated.data(), repeated_lengths.data(), repeated.size());
+    std::printf("read-ahead %-58s -> returned\n", "batch ranges, empty inputs and more than 512 windows");
     spots_intact("view reads back as written, after every hint");
 #if defined(_WIN32)
     UnmapViewOfFile((void*) base);
