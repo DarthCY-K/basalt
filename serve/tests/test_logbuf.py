@@ -180,18 +180,22 @@ class Tail(unittest.TestCase):
             self.assertEqual(b.since(0)[0][0]["msg"], "hello")
 
     def test_on_line_reports_exact_byte_offsets(self):
-        with tempfile.TemporaryDirectory() as d:
-            log = Path(d) / "events.log"
-            log.write_text("before\n", encoding="utf-8")
-            b = LogBuffer()
-            seen = []
-            threading.Thread(target=tail_file, args=(b, str(log), "eng", 0.02),
-                             kwargs={"on_line": lambda text, pos: seen.append((text, pos))}, daemon=True).start()
-            time.sleep(0.1)
-            with open(log, "a", encoding="utf-8") as f:
-                f.write("basalt serve: warning: hot\n")
-            self.wait_for(b, 1)
-            self.assertEqual(seen, [("basalt serve: warning: hot", len("before\nbasalt serve: warning: hot\n"))])
+        for newline in ("\n", "\r\n"):
+            with self.subTest(newline=newline), tempfile.TemporaryDirectory() as d:
+                log = Path(d) / "events.log"
+                before = ("before" + newline).encode("utf-8")
+                message = "basalt serve: warning: hot 热"
+                appended = (message + newline).encode("utf-8")
+                log.write_bytes(before)
+                b = LogBuffer()
+                seen = []
+                threading.Thread(target=tail_file, args=(b, str(log), "eng", 0.02),
+                                 kwargs={"on_line": lambda text, pos, seen=seen: seen.append((text, pos))}, daemon=True).start()
+                time.sleep(0.1)
+                with open(log, "ab") as f:
+                    f.write(appended)
+                self.wait_for(b, 1)
+                self.assertEqual(seen, [(message, len(before) + len(appended))])
 
     def test_skip_omits_matching_lines_from_buffer(self):
         with tempfile.TemporaryDirectory() as d:
