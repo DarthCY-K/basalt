@@ -136,7 +136,8 @@ int main() {
     // An Ada (sm_89) card: never the main card; a second card only in a -DPEER_ADA=ON build
     {
         const std::vector<GpuCard> v = {card(0, "RTX 5080", 12, 0, 960, 16), card(1, "RTX 4060 Ti", 8, 9, 288, 16)};
-        CHECK_STR(pick("1,0", v).error, "gpu: GPU 1 (RTX 4060 Ti) is sm_89, not sm_120");
+        CHECK_STR(pick("1,0", v).error,
+                  "gpu: GPU 1 (RTX 4060 Ti) is sm_89, not sm_120 (the main GPU runs the model's NVFP4 decode kernels and requires Blackwell)");
 #if defined(BASALT_PEER_ADA)
         CHECK_STR(cards(pick("0,1", v)), "0,1");
         CHECK_STR(cards(pick("auto", v)), "0,1");
